@@ -1,0 +1,206 @@
+//! Decodes the artwork with WIC and returns a 32-bit top-down DIB section,
+//! which is what `IThumbnailProvider::GetThumbnail` hands to the shell.
+//!
+//! Limits: the encoded file is capped by the finder, the source dimensions by
+//! `MAX_PIXELS`, and the requested size by `MAX_SIDE`. JPEGs are decoded at a
+//! reduced resolution through `IWICBitmapSourceTransform` (DCT-domain scaling)
+//! so a large cover never costs a full-size decode.
+
+use core::ffi::c_void;
+
+use windows::core::{Interface, Result, GUID};
+use windows::Win32::Foundation::E_FAIL;
+use windows::Win32::Graphics::Gdi::{
+    CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
+};
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameDecode,
+    IWICBitmapSource, IWICBitmapSourceTransform, IWICImagingFactory, IWICPixelFormatInfo,
+    IWICPixelFormatInfo2, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
+    WICBitmapPaletteTypeCustom, WICBitmapTransformRotate0, WICDecodeMetadataCacheOnDemand,
+};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+
+/// Largest source image we are willing to decode (width × height).
+pub const MAX_PIXELS: u64 = 16_000_000;
+/// Largest thumbnail edge we produce; the shell never asks for more.
+pub const MAX_SIDE: u32 = 2560;
+/// Largest intermediate buffer for a decoder-scaled frame.
+const MAX_SCALED_BYTES: u64 = 64 << 20;
+
+pub struct Decoded {
+    /// Top-down 32bpp BGRA DIB section. The caller owns it.
+    pub bitmap: HBITMAP,
+    pub width: u32,
+    pub height: u32,
+    /// Whether the source format carries transparency (PNG/GIF); JPEG does not.
+    pub has_alpha: bool,
+}
+
+/// Scales (w, h) down so the longer side is at most `max_side`; never scales up.
+fn fit(w: u32, h: u32, max_side: u32) -> (u32, u32) {
+    if w.max(h) <= max_side {
+        return (w, h);
+    }
+    if w >= h {
+        let th = (h as u64 * max_side as u64) / w as u64;
+        (max_side, th.max(1) as u32)
+    } else {
+        let tw = (w as u64 * max_side as u64) / h as u64;
+        (tw.max(1) as u32, max_side)
+    }
+}
+
+/// Asks the decoder for a natively downscaled frame (the JPEG codec decodes at
+/// 1/2, 1/4 or 1/8 without touching the full image). Returns `None` when the
+/// codec cannot help; the caller then scales the full frame.
+///
+/// # Safety
+/// Plain COM calls; `frame` must be a live decoder frame.
+unsafe fn decode_scaled(
+    factory: &IWICImagingFactory,
+    frame: &IWICBitmapFrameDecode,
+    full: (u32, u32),
+    target: (u32, u32),
+) -> Option<IWICBitmapSource> {
+    let transform: IWICBitmapSourceTransform = frame.cast().ok()?;
+    let (mut cw, mut ch) = target;
+    transform.GetClosestSize(&mut cw, &mut ch).ok()?;
+    // Only worth it when the codec gives us something smaller than the full
+    // frame but not smaller than what we need (we never upscale).
+    if cw == 0 || ch == 0 || cw >= full.0 || ch >= full.1 || cw < target.0 || ch < target.1 {
+        return None;
+    }
+    let mut fmt: GUID = GUID_WICPixelFormat32bppBGRA;
+    transform.GetClosestPixelFormat(&mut fmt).ok()?;
+    let bpp = factory
+        .CreateComponentInfo(&fmt)
+        .ok()?
+        .cast::<IWICPixelFormatInfo>()
+        .ok()?
+        .GetBitsPerPixel()
+        .ok()?;
+    if bpp == 0 {
+        return None;
+    }
+    let stride = (cw as u64 * bpp as u64).div_ceil(8);
+    let size = stride * ch as u64;
+    if size > MAX_SCALED_BYTES {
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    transform
+        .CopyPixels(
+            std::ptr::null(),
+            cw,
+            ch,
+            &fmt,
+            WICBitmapTransformRotate0,
+            stride as u32,
+            &mut buf,
+        )
+        .ok()?;
+    let bitmap = factory
+        .CreateBitmapFromMemory(cw, ch, &fmt, stride as u32, &buf)
+        .ok()?;
+    bitmap.cast().ok()
+}
+
+/// Decodes `data` and scales it down (never up) so the longer side is at most `max_side`.
+pub fn decode_to_dib(data: &[u8], max_side: u32) -> Result<Decoded> {
+    unsafe {
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        // A WIC stream over the caller's buffer: no second copy of the file.
+        let stream = factory.CreateStream()?;
+        stream.InitializeFromMemory(data)?;
+        let decoder = factory.CreateDecoderFromStream(
+            &stream,
+            std::ptr::null(),
+            WICDecodeMetadataCacheOnDemand,
+        )?;
+        let frame = decoder.GetFrame(0)?;
+        let (mut w, mut h) = (0u32, 0u32);
+        frame.GetSize(&mut w, &mut h)?;
+        if w == 0 || h == 0 || w as u64 * h as u64 > MAX_PIXELS {
+            return Err(E_FAIL.into());
+        }
+        let has_alpha = frame
+            .GetPixelFormat()
+            .and_then(|fmt| factory.CreateComponentInfo(&fmt))
+            .and_then(|info| info.cast::<IWICPixelFormatInfo2>())
+            .and_then(|pf| pf.SupportsTransparency())
+            .map(|b| b.as_bool())
+            .unwrap_or(false);
+
+        let max_side = max_side.clamp(1, MAX_SIDE);
+        let (tw, th) = fit(w, h, max_side);
+        let mut source: IWICBitmapSource = frame.cast()?;
+        if (tw, th) != (w, h) {
+            if let Some(scaled) = decode_scaled(&factory, &frame, (w, h), (tw, th)) {
+                source = scaled;
+            }
+            let (mut sw, mut sh) = (0u32, 0u32);
+            source.GetSize(&mut sw, &mut sh)?;
+            if (sw, sh) != (tw, th) {
+                let scaler = factory.CreateBitmapScaler()?;
+                scaler.Initialize(&source, tw, th, WICBitmapInterpolationModeFant)?;
+                source = scaler.cast()?;
+            }
+        }
+        let converter = factory.CreateFormatConverter()?;
+        converter.Initialize(
+            &source,
+            &GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )?;
+
+        let stride = tw.checked_mul(4).ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+        let len = stride as usize * th as usize;
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: tw as i32,
+                biHeight: -(th as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0)?;
+        if bits.is_null() {
+            let _ = DeleteObject(bitmap.into());
+            return Err(E_FAIL.into());
+        }
+        let buffer = std::slice::from_raw_parts_mut(bits as *mut u8, len);
+        if let Err(e) = converter.CopyPixels(std::ptr::null(), stride, buffer) {
+            let _ = DeleteObject(bitmap.into());
+            return Err(e);
+        }
+        Ok(Decoded {
+            bitmap,
+            width: tw,
+            height: th,
+            has_alpha,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit;
+
+    #[test]
+    fn fit_keeps_aspect_and_never_upscales() {
+        assert_eq!(fit(640, 360, 256), (256, 144));
+        assert_eq!(fit(360, 640, 256), (144, 256));
+        assert_eq!(fit(100, 50, 256), (100, 50));
+        assert_eq!(fit(4000, 1, 256), (256, 1));
+    }
+}

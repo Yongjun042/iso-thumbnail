@@ -1,0 +1,52 @@
+[package]
+name = "iso-thumbnail"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Windows thumbnail handler that shows the Blu-ray artwork stored inside .iso images"
+license = "MIT"
+repository = "https://github.com/Yongjun042/iso-thumbnail"
+publish = false
+
+[lib]
+name = "IsoPreview"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "isopreview-cli"
+path = "src/bin/cli.rs"
+
+[dependencies]
+windows-core = "0.62"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Graphics_Imaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# `unwind` so a panic inside the handler is caught at the COM boundary and turned
+# into an error code instead of taking Explorer down.
+panic = "unwind"
+# The parsers run on untrusted files: an arithmetic overflow must be a caught
+# panic, never a silently wrapped offset.
+overflow-checks = true
+strip = true
+debug = false
