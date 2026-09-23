@@ -9,12 +9,31 @@ if errorlevel 1 (
 )
 
 set "DEST=%ProgramFiles%\IsoPreview"
-if exist "%DEST%\isopreview-cli.exe" (
-    "%DEST%\isopreview-cli.exe" --uninstall
-) else if exist "%~dp0isopreview-cli.exe" (
-    "%~dp0isopreview-cli.exe" --uninstall
-) else (
-    regsvr32 /s /u "%DEST%\IsoPreview.dll"
+
+rem Unregister with the first CLI that runs, falling back to the DLL's own
+rem DllUnregisterServer through regsvr32. Files are deleted only once one worked.
+set "UNREGISTERED="
+set "FOUND="
+for %%C in ("%DEST%\isopreview-cli.exe" "%~dp0isopreview-cli.exe") do (
+    if not defined UNREGISTERED if exist "%%~C" (
+        set "FOUND=1"
+        "%%~C" --uninstall && set "UNREGISTERED=1"
+    )
+)
+for %%D in ("%DEST%\IsoPreview.dll" "%~dp0IsoPreview.dll") do (
+    if not defined UNREGISTERED if exist "%%~D" (
+        set "FOUND=1"
+        regsvr32 /s /u "%%~D" && set "UNREGISTERED=1"
+    )
+)
+if not defined UNREGISTERED (
+    if defined FOUND (
+        echo Could not remove the registration: isopreview-cli.exe and regsvr32 both failed.
+    ) else (
+        echo Could not find isopreview-cli.exe or IsoPreview.dll to remove the registration with.
+    )
+    echo Nothing was deleted.
+    exit /b 1
 )
 
 if exist "%DEST%" (

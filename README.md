@@ -76,8 +76,9 @@ scripts\uninstall.cmd
 ```
 
 시스템 전체 설치는 관리자 프롬프트에서 `scripts\uninstall-machine.cmd`를 실행합니다.
-`isopreview-cli --uninstall`이나 `regsvr32 /u /n /i:user IsoPreview.dll`로도 등록을 해제할 수 있으며,
-`uninstall.cmd`는 CLI를 실행하지 못하면 `regsvr32`로 해제합니다.
+`isopreview-cli --uninstall`이나 `regsvr32 /u /n /i:user IsoPreview.dll`로도 등록을 해제할 수 있습니다.
+제거 스크립트는 찾을 수 있는 CLI를 차례로 실행하고, 모두 실패하면 `regsvr32`로 해제합니다. 등록을 해제하지 못하면
+파일을 지우지 않고 오류로 끝나므로, 등록만 남고 DLL이 사라지는 일은 없습니다.
 썸네일 대리 프로세스(`dllhost.exe`)가 DLL을 아직 물고 있으면 파일 삭제가 잠시 미뤄질 수 있습니다. 대리 프로세스는 한동안
 쓰이지 않으면 스스로 끝나므로 조금 뒤에 다시 지우면 됩니다. 이전 버전으로 설치해서 탐색기가 DLL을 직접 물고 있다면
 탐색기를 다시 시작하세요.

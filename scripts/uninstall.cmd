@@ -3,15 +3,32 @@ setlocal
 rem Removes the per-user registration and the installed files.
 
 set "DEST=%LocalAppData%\Programs\IsoPreview"
-if exist "%DEST%\isopreview-cli.exe" (
-    rem Fall back to regsvr32 if the CLI is blocked, e.g. by an antivirus heuristic.
-    "%DEST%\isopreview-cli.exe" --uninstall || regsvr32 /s /u /n /i:user "%DEST%\IsoPreview.dll"
-) else if exist "%~dp0isopreview-cli.exe" (
-    "%~dp0isopreview-cli.exe" --uninstall
-) else if exist "%~dp0..\target\release\isopreview-cli.exe" (
-    "%~dp0..\target\release\isopreview-cli.exe" --uninstall
-) else (
-    regsvr32 /s /u /n /i:user "%DEST%\IsoPreview.dll"
+
+rem Unregister with the first CLI that runs. The CLI can be blocked (antivirus
+rem heuristics sometimes stop unsigned tools), so fall back to the DLL's own
+rem DllInstall through regsvr32. Files are deleted only once one of them worked.
+set "UNREGISTERED="
+set "FOUND="
+for %%C in ("%DEST%\isopreview-cli.exe" "%~dp0isopreview-cli.exe" "%~dp0..\target\release\isopreview-cli.exe") do (
+    if not defined UNREGISTERED if exist "%%~C" (
+        set "FOUND=1"
+        "%%~C" --uninstall && set "UNREGISTERED=1"
+    )
+)
+for %%D in ("%DEST%\IsoPreview.dll" "%~dp0IsoPreview.dll" "%~dp0..\target\release\IsoPreview.dll") do (
+    if not defined UNREGISTERED if exist "%%~D" (
+        set "FOUND=1"
+        regsvr32 /s /u /n /i:user "%%~D" && set "UNREGISTERED=1"
+    )
+)
+if not defined UNREGISTERED (
+    if defined FOUND (
+        echo Could not remove the registration: isopreview-cli.exe and regsvr32 both failed.
+    ) else (
+        echo Could not find isopreview-cli.exe or IsoPreview.dll to remove the registration with.
+    )
+    echo Nothing was deleted.
+    exit /b 1
 )
 
 if exist "%DEST%" (
