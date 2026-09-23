@@ -56,7 +56,7 @@ pub extern "system" fn DllGetClassObject(
         if *rclsid != CLSID_ISO_THUMBNAIL {
             return CLASS_E_CLASSNOTAVAILABLE;
         }
-        let factory: IUnknown = ClassFactory.into();
+        let factory: IUnknown = ClassFactory::new().into();
         factory.query(riid, ppv)
     }
 }

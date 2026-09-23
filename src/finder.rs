@@ -6,11 +6,14 @@
 //! 3. `cover.jpg`, `folder.jpg`, … in the root directory of any data disc.
 
 use crate::error::{Error, Result};
-use crate::fs::FileSystem;
+use crate::fs::{DirEntry, FileSystem};
 
 /// Largest artwork file we are willing to load. Blu-ray thumbnails are a few
 /// hundred KiB; this only limits the root-level cover fallback.
 pub const MAX_IMAGE_BYTES: usize = 16 << 20;
+/// Most picture files considered in one directory. Real `META/DL` and
+/// `META/TN` directories hold a handful; the cap bounds per-candidate work.
+const MAX_IMAGE_CANDIDATES: usize = 64;
 
 const IMAGE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "bmp", "gif"];
 const ROOT_COVER_NAMES: [&str; 7] = [
@@ -74,61 +77,81 @@ fn dims_from_name(name: &str) -> Option<(u64, u64)> {
     None
 }
 
+/// Pixel area from the `WxH` in a file name; 0 when absent or implausible.
+fn area_from_name(name: &str) -> u64 {
+    dims_from_name(name)
+        .and_then(|(w, h)| w.checked_mul(h))
+        .unwrap_or(0)
+}
+
+/// Reads the first candidate that is non-empty, within `MAX_IMAGE_BYTES` and
+/// readable, so one broken file does not hide the next.
+fn first_readable<F: FileSystem>(
+    fs: &mut F,
+    candidates: impl IntoIterator<Item = (String, F::Node)>,
+) -> Option<Thumbnail> {
+    for (path, node) in candidates {
+        let size = fs.file_size(&node).unwrap_or(0);
+        if size == 0 || size > MAX_IMAGE_BYTES as u64 {
+            continue;
+        }
+        if let Ok(data) = fs.read(&node, MAX_IMAGE_BYTES) {
+            return Some(Thumbnail { path, data });
+        }
+    }
+    None
+}
+
 /// Picks the largest picture in `dir`: by the dimensions in its name, then by
-/// file size. Empty and oversized files are skipped.
+/// file size. Empty, oversized and unreadable files are skipped.
 fn best_image_in<F: FileSystem>(
     fs: &mut F,
     dir: &F::Node,
     prefix: &str,
 ) -> Result<Option<Thumbnail>> {
-    let images = fs.list_where(dir, &mut |e| !e.is_dir && has_image_ext(&e.name))?;
-    // (area from the file name, file size, index into `images`)
-    let mut best: Option<(u64, u64, usize)> = None;
-    for (i, e) in images.iter().enumerate() {
-        let size = fs.file_size(&e.node).unwrap_or(0);
-        if size == 0 || size > MAX_IMAGE_BYTES as u64 {
-            continue;
+    let mut images = Vec::new();
+    fs.walk(dir, &mut |e| {
+        if !e.is_dir && has_image_ext(&e.name) {
+            images.push(e);
         }
-        let area = dims_from_name(&e.name).map_or(0, |(w, h)| w * h);
-        if best.is_none_or(|(a, s, _)| (area, size) > (a, s)) {
-            best = Some((area, size, i));
-        }
-    }
-    match best {
-        Some((_, _, i)) => {
-            let e = &images[i];
-            let data = fs.read(&e.node, MAX_IMAGE_BYTES)?;
-            Ok(Some(Thumbnail {
-                path: format!("{prefix}/{}", e.name),
-                data,
-            }))
-        }
-        None => Ok(None),
-    }
-}
-
-fn named_cover_in<F: FileSystem>(fs: &mut F, dir: &F::Node) -> Result<Option<Thumbnail>> {
-    let covers = fs.list_where(dir, &mut |e| {
-        !e.is_dir && has_image_ext(&e.name) && is_cover_name(&e.name)
+        images.len() < MAX_IMAGE_CANDIDATES
     })?;
-    for wanted in ROOT_COVER_NAMES {
-        let hit = covers
-            .iter()
-            .find(|e| split_ext(&e.name).0.eq_ignore_ascii_case(wanted));
-        if let Some(e) = hit {
-            let data = fs.read(&e.node, MAX_IMAGE_BYTES)?;
-            return Ok(Some(Thumbnail {
-                path: e.name.clone(),
-                data,
-            }));
-        }
-    }
-    Ok(None)
+    // (area from the file name, file size, entry), largest first. The sort is
+    // stable, so ties keep directory order.
+    let mut ranked: Vec<(u64, u64, DirEntry<F::Node>)> = images
+        .into_iter()
+        .map(|e| {
+            let size = fs.file_size(&e.node).unwrap_or(0);
+            (area_from_name(&e.name), size, e)
+        })
+        .collect();
+    ranked.sort_by_key(|&(area, size, _)| std::cmp::Reverse((area, size)));
+    let candidates = ranked
+        .into_iter()
+        .map(|(_, _, e)| (format!("{prefix}/{}", e.name), e.node));
+    Ok(first_readable(fs, candidates))
 }
 
 pub fn find_thumbnail<F: FileSystem>(fs: &mut F) -> Result<Thumbnail> {
     let root = fs.root()?;
-    if let Some(bdmv) = fs.lookup(&root, "BDMV", true)? {
+    // One pass over the root collects both the BDMV folder and the cover
+    // fallbacks: every walk reads the whole directory from the image again.
+    let mut bdmv = None;
+    let mut covers = Vec::new();
+    fs.walk(&root, &mut |e| {
+        if e.is_dir {
+            if bdmv.is_none() && e.name.eq_ignore_ascii_case("BDMV") {
+                bdmv = Some(e.node);
+            }
+        } else if has_image_ext(&e.name)
+            && is_cover_name(&e.name)
+            && covers.len() < MAX_IMAGE_CANDIDATES
+        {
+            covers.push(e);
+        }
+        true
+    })?;
+    if let Some(bdmv) = bdmv {
         if let Some(meta) = fs.lookup(&bdmv, "META", true)? {
             for sub in ["DL", "TN"] {
                 if let Some(dir) = fs.lookup(&meta, sub, true)? {
@@ -139,7 +162,14 @@ pub fn find_thumbnail<F: FileSystem>(fs: &mut F) -> Result<Thumbnail> {
             }
         }
     }
-    named_cover_in(fs, &root)?.ok_or(Error::NotFound)
+    // Root covers in the priority order of ROOT_COVER_NAMES.
+    let candidates = ROOT_COVER_NAMES.iter().flat_map(|wanted| {
+        covers
+            .iter()
+            .filter(|e| split_ext(&e.name).0.eq_ignore_ascii_case(wanted))
+            .map(|e| (e.name.clone(), e.node.clone()))
+    });
+    first_readable(fs, candidates).ok_or(Error::NotFound)
 }
 
 #[cfg(test)]
@@ -154,6 +184,13 @@ mod tests {
         assert_eq!(dims_from_name("x.jpg"), None);
         assert_eq!(dims_from_name("0x1F.jpg"), None);
         assert_eq!(dims_from_name("é640x360.jpg"), Some((640, 360)));
+    }
+
+    #[test]
+    fn huge_dimensions_in_names_do_not_overflow() {
+        assert_eq!(area_from_name("COVER_18446744073709551615x2.jpg"), 0);
+        assert_eq!(area_from_name("MOVIE_640x360.jpg"), 230_400);
+        assert_eq!(area_from_name("cover.jpg"), 0);
     }
 
     #[test]

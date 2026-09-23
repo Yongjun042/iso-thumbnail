@@ -7,10 +7,12 @@
 use core::ffi::c_void;
 use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::core::{implement, IUnknown, Interface, Ref, Result, BOOL, GUID};
-use windows::Win32::Foundation::{CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, E_UNEXPECTED};
+use windows::Win32::Foundation::{
+    CLASS_E_NOAGGREGATION, ERROR_ALREADY_INITIALIZED, E_FAIL, E_POINTER, E_UNEXPECTED,
+};
 use windows::Win32::Graphics::Gdi::HBITMAP;
 use windows::Win32::System::Com::{
     IClassFactory, IClassFactory_Impl, IStream, STATFLAG_NONAME, STATSTG, STREAM_SEEK_END,
@@ -30,23 +32,30 @@ use crate::reader::ByteSource;
 /// CLSID of the handler: {C767266A-4032-4099-9A92-F91D1FE98122}.
 pub const CLSID_ISO_THUMBNAIL: GUID = GUID::from_u128(0xC767266A_4032_4099_9A92_F91D1FE98122);
 
-/// Live COM objects plus `IClassFactory::LockServer` locks; drives `DllCanUnloadNow`.
-static SERVER_LOCKS: AtomicIsize = AtomicIsize::new(0);
+/// Live COM objects (providers and class factories); drives `DllCanUnloadNow`.
+static LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
+/// Outstanding `IClassFactory::LockServer(TRUE)` calls.
+static SERVER_LOCKS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn server_locked() -> bool {
-    SERVER_LOCKS.load(Ordering::SeqCst) > 0
+    LIVE_OBJECTS.load(Ordering::SeqCst) > 0 || SERVER_LOCKS.load(Ordering::SeqCst) > 0
 }
 
-fn lock_server() {
-    SERVER_LOCKS.fetch_add(1, Ordering::SeqCst);
+fn object_created() {
+    LIVE_OBJECTS.fetch_add(1, Ordering::SeqCst);
 }
 
-fn unlock_server() {
-    SERVER_LOCKS.fetch_sub(1, Ordering::SeqCst);
+fn object_destroyed() {
+    LIVE_OBJECTS.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// `ByteSource` over the `IStream` the shell hands us.
 pub struct StreamSource(pub IStream);
+
+/// Most `IStream::Read` calls one request may take. File streams fill the
+/// buffer in one call; this bounds a stream that trickles a few bytes at a
+/// time, which the reader's per-request read cap would not otherwise see.
+const MAX_STREAM_READS_PER_REQUEST: usize = 64;
 
 impl ByteSource for StreamSource {
     fn size(&mut self) -> crate::error::Result<u64> {
@@ -69,32 +78,43 @@ impl ByteSource for StreamSource {
                 .Seek(offset as i64, STREAM_SEEK_SET, None)
                 .map_err(|_| ParseError::Io)?;
             let mut done = 0usize;
-            while done < buf.len() {
+            for _ in 0..MAX_STREAM_READS_PER_REQUEST {
+                if done == buf.len() {
+                    return Ok(());
+                }
                 let remaining = &mut buf[done..];
+                let want = u32::try_from(remaining.len()).map_err(|_| ParseError::Io)?;
                 let mut got = 0u32;
                 let hr = self.0.Read(
                     remaining.as_mut_ptr() as *mut c_void,
-                    remaining.len() as u32,
+                    want,
                     Some(&mut got as *mut u32),
                 );
-                if hr.is_err() || got == 0 {
+                if hr.is_err() || got == 0 || got > want {
                     return Err(ParseError::Io);
                 }
                 done += got as usize;
             }
-            Ok(())
+            if done == buf.len() {
+                Ok(())
+            } else {
+                Err(ParseError::Io)
+            }
         }
     }
 }
 
-#[implement(IThumbnailProvider, IInitializeWithStream)]
+/// Not agile: the class is registered `ThreadingModel=Apartment` and keeps its
+/// state in a `RefCell`, so COM must marshal cross-apartment calls instead of
+/// handing out the raw pointer (the default free-threaded marshaler would).
+#[implement(IThumbnailProvider, IInitializeWithStream, Agile = false)]
 pub struct ThumbnailProvider {
     stream: RefCell<Option<IStream>>,
 }
 
 impl ThumbnailProvider {
     pub fn new() -> Self {
-        lock_server();
+        object_created();
         Self {
             stream: RefCell::new(None),
         }
@@ -109,14 +129,27 @@ impl Default for ThumbnailProvider {
 
 impl Drop for ThumbnailProvider {
     fn drop(&mut self) {
-        unlock_server();
+        // Release the stream while the DLL still counts as in use.
+        drop(self.stream.get_mut().take());
+        object_destroyed();
     }
 }
 
 impl IInitializeWithStream_Impl for ThumbnailProvider_Impl {
     fn Initialize(&self, pstream: Ref<'_, IStream>, _grfmode: u32) -> Result<()> {
         let stream = pstream.ok()?.clone();
-        *self.stream.borrow_mut() = Some(stream);
+        // Borrow conflicts (re-entrant calls) become an error, never a panic:
+        // a panic here would cross the COM boundary.
+        let mut slot = self
+            .stream
+            .try_borrow_mut()
+            .map_err(|_| windows::core::Error::from(E_UNEXPECTED))?;
+        // A handler is initialized once; the contract says to refuse a second
+        // stream. `stream` is released after `slot`, outside the borrow.
+        if slot.is_some() {
+            return Err(ERROR_ALREADY_INITIALIZED.to_hresult().into());
+        }
+        *slot = Some(stream);
         Ok(())
     }
 }
@@ -148,8 +181,9 @@ impl IThumbnailProvider_Impl for ThumbnailProvider_Impl {
         }
         let stream = self
             .stream
-            .borrow()
-            .clone()
+            .try_borrow()
+            .ok()
+            .and_then(|s| s.clone())
             .ok_or_else(|| windows::core::Error::from(E_UNEXPECTED))?;
         // A panic must never cross the COM boundary.
         match catch_unwind(AssertUnwindSafe(|| render(stream, cx))) {
@@ -164,8 +198,31 @@ impl IThumbnailProvider_Impl for ThumbnailProvider_Impl {
     }
 }
 
+/// Counted like the providers: a client holding only the factory must keep the
+/// DLL loaded.
 #[implement(IClassFactory)]
-pub struct ClassFactory;
+pub struct ClassFactory {
+    _counted: (),
+}
+
+impl ClassFactory {
+    pub fn new() -> Self {
+        object_created();
+        Self { _counted: () }
+    }
+}
+
+impl Default for ClassFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ClassFactory {
+    fn drop(&mut self) {
+        object_destroyed();
+    }
+}
 
 impl IClassFactory_Impl for ClassFactory_Impl {
     fn CreateInstance(
@@ -189,9 +246,12 @@ impl IClassFactory_Impl for ClassFactory_Impl {
 
     fn LockServer(&self, flock: BOOL) -> Result<()> {
         if flock.as_bool() {
-            lock_server();
+            SERVER_LOCKS.fetch_add(1, Ordering::SeqCst);
         } else {
-            unlock_server();
+            // An unbalanced unlock must not wrap the count and let the DLL
+            // unload under live objects.
+            let _ = SERVER_LOCKS
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         }
         Ok(())
     }

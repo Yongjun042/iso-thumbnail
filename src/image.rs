@@ -4,7 +4,8 @@
 //! Limits: the encoded file is capped by the finder, the source dimensions by
 //! `MAX_PIXELS`, and the requested size by `MAX_SIDE`. JPEGs are decoded at a
 //! reduced resolution through `IWICBitmapSourceTransform` (DCT-domain scaling)
-//! so a large cover never costs a full-size decode.
+//! so a large cover never costs a full-size decode. Only JPEG, PNG, GIF and BMP
+//! are decoded, by Windows' built-in decoders picked from the file signature.
 
 use core::ffi::c_void;
 
@@ -14,7 +15,8 @@ use windows::Win32::Graphics::Gdi::{
     CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameDecode,
+    CLSID_WICBmpDecoder, CLSID_WICGifDecoder, CLSID_WICImagingFactory, CLSID_WICJpegDecoder,
+    CLSID_WICPngDecoder, GUID_WICPixelFormat32bppBGRA, IWICBitmapDecoder, IWICBitmapFrameDecode,
     IWICBitmapSource, IWICBitmapSourceTransform, IWICImagingFactory, IWICPixelFormatInfo,
     IWICPixelFormatInfo2, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
     WICBitmapPaletteTypeCustom, WICBitmapTransformRotate0, WICDecodeMetadataCacheOnDemand,
@@ -35,6 +37,24 @@ pub struct Decoded {
     pub height: u32,
     /// Whether the source format carries transparency (PNG/GIF); JPEG does not.
     pub has_alpha: bool,
+}
+
+/// Windows' built-in decoder for the file signature, or `None` for anything
+/// that is not JPEG, PNG, GIF or BMP. Letting WIC pick a codec from the content
+/// would hand attacker bytes to every installed codec (TIFF, JPEG XR, camera
+/// RAW, third-party codecs), some of which ignore the pixel limits below.
+fn decoder_for(data: &[u8]) -> Option<&'static GUID> {
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(&CLSID_WICJpegDecoder)
+    } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(&CLSID_WICPngDecoder)
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some(&CLSID_WICGifDecoder)
+    } else if data.starts_with(b"BM") {
+        Some(&CLSID_WICBmpDecoder)
+    } else {
+        None
+    }
 }
 
 /// Scales (w, h) down so the longer side is at most `max_side`; never scales up.
@@ -108,17 +128,16 @@ unsafe fn decode_scaled(
 
 /// Decodes `data` and scales it down (never up) so the longer side is at most `max_side`.
 pub fn decode_to_dib(data: &[u8], max_side: u32) -> Result<Decoded> {
+    let decoder_clsid = decoder_for(data).ok_or_else(|| windows::core::Error::from(E_FAIL))?;
     unsafe {
         let factory: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         // A WIC stream over the caller's buffer: no second copy of the file.
         let stream = factory.CreateStream()?;
         stream.InitializeFromMemory(data)?;
-        let decoder = factory.CreateDecoderFromStream(
-            &stream,
-            std::ptr::null(),
-            WICDecodeMetadataCacheOnDemand,
-        )?;
+        let decoder: IWICBitmapDecoder =
+            CoCreateInstance(decoder_clsid, None, CLSCTX_INPROC_SERVER)?;
+        decoder.Initialize(&stream, WICDecodeMetadataCacheOnDemand)?;
         let frame = decoder.GetFrame(0)?;
         let (mut w, mut h) = (0u32, 0u32);
         frame.GetSize(&mut w, &mut h)?;
@@ -194,7 +213,18 @@ pub fn decode_to_dib(data: &[u8], max_side: u32) -> Result<Decoded> {
 
 #[cfg(test)]
 mod tests {
-    use super::fit;
+    use super::{decoder_for, fit};
+
+    #[test]
+    fn only_builtin_formats_get_a_decoder() {
+        assert!(decoder_for(b"\xFF\xD8\xFF\xE0jfif").is_some());
+        assert!(decoder_for(b"\x89PNG\r\n\x1a\n....").is_some());
+        assert!(decoder_for(b"GIF89a..").is_some());
+        assert!(decoder_for(b"BM......").is_some());
+        assert!(decoder_for(b"II*\0tiff").is_none());
+        assert!(decoder_for(b"II\xBC\x01jxr").is_none());
+        assert!(decoder_for(b"").is_none());
+    }
 
     #[test]
     fn fit_keeps_aspect_and_never_upscales() {

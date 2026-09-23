@@ -20,7 +20,7 @@ if exist "%DEST%\isopreview-cli.exe" (
 if exist "%DEST%" (
     rd /s /q "%DEST%" 2>nul
     if exist "%DEST%" (
-        echo The registration was removed. %DEST% could not be deleted yet because a
+        echo The registration was removed. "%DEST%" could not be deleted yet because a
         echo COM surrogate still has the DLL loaded; delete it after restarting Explorer.
     )
 )

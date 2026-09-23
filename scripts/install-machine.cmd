@@ -26,11 +26,11 @@ copy /y "%SRC%isopreview-cli.exe" "%DEST%\" >nul || goto :copyfail
 if errorlevel 1 exit /b 1
 
 echo.
-echo Installed to %DEST% and registered for all users.
+echo Installed to "%DEST%" and registered for all users.
 echo Users who already looked at .iso files may need to restart Explorer.
 exit /b 0
 
 :copyfail
-echo Could not copy the files to %DEST%. If an older version is installed its DLL
+echo Could not copy the files to "%DEST%". If an older version is installed its DLL
 echo may still be loaded: run restart-explorer.cmd and try again.
 exit /b 1

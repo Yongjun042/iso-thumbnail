@@ -400,6 +400,61 @@ fn truncated_images_fail_without_panicking() {
 }
 
 #[test]
+fn indirect_entry_is_followed() {
+    // Type 1 partition image; move the big cover's FE (block 11) to block 40
+    // and put a strategy-4096 Indirect Entry at block 11 pointing there.
+    let mut data = build_udf(false, true, None);
+    let at = |b: u32| (PART_START + b) as usize * SECTOR;
+    let mut moved = data[at(11)..at(11) + SECTOR].to_vec();
+    moved[..16].copy_from_slice(&tag(261, 40));
+    data[at(40)..at(40) + SECTOR].copy_from_slice(&moved);
+    let mut ie = vec![0u8; SECTOR];
+    ie[..16].copy_from_slice(&tag(259, 11));
+    ie[20..22].copy_from_slice(&4096u16.to_le_bytes()); // strategy type 4096
+    ie[24..26].copy_from_slice(&2u16.to_le_bytes()); // maximum number of entries
+    ie[27] = 3; // file type: indirect entry
+    ie[36..52].copy_from_slice(&long_ad(SECTOR as u32, 40, 0)); // Indirect ICB
+    data[at(11)..at(11) + SECTOR].copy_from_slice(&ie);
+    let found = extract(&data).unwrap();
+    assert_big_cover(&found, "UDF 1.02");
+}
+
+#[test]
+fn broken_root_cover_does_not_hide_the_next_one() {
+    // Data disc without BDMV. FOLDER.JPG is too large, COVER.JPG points past
+    // the end of the image; POSTER.JPG, next in priority, must still be used.
+    let mut img = Image::new(20);
+    let mut pvd = vec![0u8; SECTOR];
+    pvd[0] = 1;
+    pvd[1..6].copy_from_slice(b"CD001");
+    pvd[6] = 1;
+    pvd[156..190].copy_from_slice(&iso_record(&[0], 18, SECTOR as u32, true));
+    img.put(16, 0, &pvd);
+    let mut term = vec![0u8; 7];
+    term[0] = 255;
+    term[1..6].copy_from_slice(b"CD001");
+    term[6] = 1;
+    img.put(17, 0, &term);
+    img.put(
+        18,
+        0,
+        &iso_dir(
+            18,
+            18,
+            &[
+                (b"FOLDER.JPG;1".to_vec(), 19, 17 << 20, false),
+                (b"COVER.JPG;1".to_vec(), 400, 64, false),
+                (b"POSTER.JPG;1".to_vec(), 19, JPEG_BIG.len() as u32, false),
+            ],
+        ),
+    );
+    img.put(19, 0, JPEG_BIG);
+    let found = extract(&img.data).unwrap();
+    assert_eq!(found.thumbnail.path, "POSTER.JPG");
+    assert_eq!(found.thumbnail.data, JPEG_BIG);
+}
+
+#[test]
 fn read_budget_stops_the_walk() {
     let image = build_udf(true, true, None);
     let mut rd = CachedReader::with_budget(SeekSource(Cursor::new(image)), 4096).unwrap();

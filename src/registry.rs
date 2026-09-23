@@ -8,16 +8,21 @@
 //! `Shell Extensions\Approved`, which only matters when the
 //! "EnforceShellExtensionSecurity" policy is enabled.
 //!
-//! A per-user install additionally sets `DisableProcessIsolation=1` on the
-//! CLSID: the shell's out-of-process thumbnail host cannot activate classes
-//! that are registered only under `HKEY_CURRENT_USER`.
+//! Neither scope sets `DisableProcessIsolation`, so Explorer runs the handler
+//! in its isolated thumbnail host (`dllhost.exe`) rather than in `explorer.exe`.
+//! That host sees per-user registrations too.
+//!
+//! If another program's thumbnail handler held `.iso` in the same hive, its
+//! CLSID is saved under our CLSID key and put back when we are unregistered.
 
 use windows::core::{Error, Result, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_SUCCESS, WIN32_ERROR,
+};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW,
     RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ,
-    KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
+    KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
 };
 use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
 
@@ -88,19 +93,6 @@ fn set_string(key: &Key, name: &str, value: &str) -> Result<()> {
     unsafe { RegSetValueExW(key.0, &HSTRING::from(name), None, REG_SZ, Some(bytes)).ok() }
 }
 
-fn set_dword(key: &Key, name: &str, value: u32) -> Result<()> {
-    unsafe {
-        RegSetValueExW(
-            key.0,
-            &HSTRING::from(name),
-            None,
-            REG_DWORD,
-            Some(&value.to_le_bytes()),
-        )
-        .ok()
-    }
-}
-
 /// What the `.ext\ShellEx\{thumbnail handler}` key currently points at.
 enum ShellExOwner {
     /// The key does not exist.
@@ -111,42 +103,61 @@ enum ShellExOwner {
     Other,
 }
 
-fn shellex_owner(root: HKEY, path: &str) -> ShellExOwner {
+fn open_key_read(root: HKEY, path: &str) -> std::result::Result<Key, WIN32_ERROR> {
     let mut handle = HKEY::default();
-    let opened = unsafe { RegOpenKeyExW(root, &HSTRING::from(path), None, KEY_READ, &mut handle) };
-    if opened == ERROR_FILE_NOT_FOUND {
-        return ShellExOwner::Missing;
+    let status = unsafe { RegOpenKeyExW(root, &HSTRING::from(path), None, KEY_READ, &mut handle) };
+    if status == ERROR_SUCCESS {
+        Ok(Key(handle))
+    } else {
+        Err(status)
     }
-    if opened != ERROR_SUCCESS {
-        return ShellExOwner::Other;
-    }
-    let key = Key(handle);
+}
+
+/// Reads the REG_SZ value `name`: `ERROR_FILE_NOT_FOUND` when it is missing,
+/// `ERROR_INVALID_DATA` when it has another type.
+fn query_sz(key: &Key, name: &str) -> std::result::Result<String, WIN32_ERROR> {
     let mut buf = [0u16; 256];
     let mut len = (buf.len() * 2) as u32;
     let mut ty = REG_VALUE_TYPE::default();
     let status = unsafe {
         RegQueryValueExW(
             key.0,
-            &HSTRING::from(""),
+            &HSTRING::from(name),
             None,
             Some(&mut ty),
             Some(buf.as_mut_ptr() as *mut u8),
             Some(&mut len),
         )
     };
-    if status == ERROR_FILE_NOT_FOUND {
-        return ShellExOwner::Us;
+    if status != ERROR_SUCCESS {
+        return Err(status);
     }
-    if status != ERROR_SUCCESS || ty != REG_SZ {
-        return ShellExOwner::Other;
+    if ty != REG_SZ {
+        return Err(ERROR_INVALID_DATA);
     }
     let n = (len as usize / 2).min(buf.len());
-    let value = String::from_utf16_lossy(&buf[..n]);
-    if value.trim_end_matches('\0').eq_ignore_ascii_case(CLSID_TEXT) {
-        ShellExOwner::Us
-    } else {
-        ShellExOwner::Other
+    Ok(String::from_utf16_lossy(&buf[..n])
+        .trim_end_matches('\0')
+        .to_string())
+}
+
+fn shellex_owner(root: HKEY, path: &str) -> ShellExOwner {
+    let key = match open_key_read(root, path) {
+        Ok(key) => key,
+        Err(status) if status == ERROR_FILE_NOT_FOUND => return ShellExOwner::Missing,
+        Err(_) => return ShellExOwner::Other,
+    };
+    match query_sz(&key, "") {
+        Ok(value) if value.eq_ignore_ascii_case(CLSID_TEXT) => ShellExOwner::Us,
+        Err(status) if status == ERROR_FILE_NOT_FOUND => ShellExOwner::Us,
+        _ => ShellExOwner::Other,
     }
+}
+
+/// Value under our CLSID key that remembers the thumbnail handler another
+/// program had registered for `ext` in the same hive before we took over.
+fn previous_handler_value(ext: &str) -> String {
+    format!("PreviousThumbnailHandler{ext}")
 }
 
 /// Deletes a key and everything below it; a missing key is not an error.
@@ -170,22 +181,28 @@ pub fn is_access_denied(e: &Error) -> bool {
 pub fn register(scope: Scope, dll_path: &str) -> Result<()> {
     let root = scope.root();
     let clsid_path = format!("Software\\Classes\\CLSID\\{CLSID_TEXT}");
-    let key = create_key(root, &clsid_path)?;
-    set_string(&key, "", HANDLER_NAME)?;
-    if scope == Scope::User {
-        // The shell's isolated thumbnail host (dllhost.exe) does not see per-user
-        // COM registrations and fails with REGDB_E_CLASSNOTREG, so a per-user
-        // install has to run the handler inside the requesting process instead.
-        set_dword(&key, "DisableProcessIsolation", 1)?;
+    let clsid_key = create_key(root, &clsid_path)?;
+    set_string(&clsid_key, "", HANDLER_NAME)?;
+    // Keep the shell's process isolation so the handler runs in the isolated
+    // thumbnail host (dllhost.exe), which also finds per-user registrations.
+    // Older versions set DisableProcessIsolation=1 on per-user installs; drop it
+    // so reinstalling over them moves the handler out of explorer.exe.
+    unsafe {
+        let _ = RegDeleteValueW(clsid_key.0, &HSTRING::from("DisableProcessIsolation"));
     }
     let key = create_key(root, &format!("{clsid_path}\\InprocServer32"))?;
     set_string(&key, "", dll_path)?;
     set_string(&key, "ThreadingModel", "Apartment")?;
     for ext in EXTENSIONS {
-        let key = create_key(
-            root,
-            &format!("Software\\Classes\\{ext}\\ShellEx\\{THUMBNAIL_HANDLER_IID}"),
-        )?;
+        let path = format!("Software\\Classes\\{ext}\\ShellEx\\{THUMBNAIL_HANDLER_IID}");
+        // Remember another program's handler so unregistering can restore it.
+        // A reinstall finds our own CLSID here and keeps the saved value.
+        if let Ok(previous) = open_key_read(root, &path).and_then(|k| query_sz(&k, "")) {
+            if !previous.is_empty() && !previous.eq_ignore_ascii_case(CLSID_TEXT) {
+                set_string(&clsid_key, &previous_handler_value(ext), &previous)?;
+            }
+        }
+        let key = create_key(root, &path)?;
         set_string(&key, "", CLSID_TEXT)?;
     }
     if scope == Scope::Machine {
@@ -200,15 +217,29 @@ pub fn register(scope: Scope, dll_path: &str) -> Result<()> {
 /// Removes the registration. Returns whether anything was found to remove.
 pub fn unregister(scope: Scope) -> Result<bool> {
     let root = scope.root();
+    let clsid_path = format!("Software\\Classes\\CLSID\\{CLSID_TEXT}");
     let mut removed = false;
     for ext in EXTENSIONS {
         let path = format!("Software\\Classes\\{ext}\\ShellEx\\{THUMBNAIL_HANDLER_IID}");
         match shellex_owner(root, &path) {
-            ShellExOwner::Us => removed |= delete_tree(root, &path)?,
+            ShellExOwner::Us => {
+                // Hand the extension back to the handler we replaced, if any.
+                let previous = open_key_read(root, &clsid_path)
+                    .and_then(|k| query_sz(&k, &previous_handler_value(ext)))
+                    .ok()
+                    .filter(|p| !p.is_empty());
+                match previous {
+                    Some(previous) => {
+                        set_string(&open_key_write(root, &path)?, "", &previous)?;
+                        removed = true;
+                    }
+                    None => removed |= delete_tree(root, &path)?,
+                }
+            }
             ShellExOwner::Missing | ShellExOwner::Other => {}
         }
     }
-    removed |= delete_tree(root, &format!("Software\\Classes\\CLSID\\{CLSID_TEXT}"))?;
+    removed |= delete_tree(root, &clsid_path)?;
     if scope == Scope::Machine {
         if let Ok(key) = open_key_write(root, APPROVED_PATH) {
             unsafe {

@@ -69,9 +69,10 @@ enum MapKind {
     /// Type 1 map, or a sparable map treated as one (sparing tables are ignored).
     Physical,
     /// UDF 2.50+ metadata partition: logical blocks live in the extents of the
-    /// metadata file. Each entry: (number of blocks, absolute sector of the
-    /// first block, or `None` when the extent is not recorded).
-    Metadata(Vec<(u32, Option<u64>)>),
+    /// metadata file. Each entry: (first logical block of the extent, number of
+    /// blocks, absolute sector of the first block or `None` when the extent is
+    /// not recorded). The first blocks are strictly increasing.
+    Metadata(Vec<(u64, u32, Option<u64>)>),
     /// Virtual partition on write-once media: the VAT maps virtual to physical blocks.
     Virtual(Vec<u32>),
 }
@@ -428,16 +429,20 @@ impl<'a, S: ByteSource> Udf<'a, S> {
         match &map.kind {
             MapKind::Physical => Ok(part.start as u64 + block as u64),
             MapKind::Metadata(extents) => {
-                let mut rel = block;
-                for &(blocks, sector) in extents {
-                    if rel < blocks {
-                        return sector
-                            .map(|s| s + rel as u64)
-                            .ok_or(Error::Corrupt("metadata block not recorded"));
-                    }
-                    rel -= blocks;
+                // Binary search: this runs for every descriptor of every entry.
+                let block = block as u64;
+                let i = extents.partition_point(|&(first, _, _)| first <= block);
+                let &(first, blocks, sector) = i
+                    .checked_sub(1)
+                    .and_then(|i| extents.get(i))
+                    .ok_or(Error::Corrupt("metadata block outside metadata file"))?;
+                let rel = block - first;
+                if rel >= blocks as u64 {
+                    return Err(Error::Corrupt("metadata block outside metadata file"));
                 }
-                Err(Error::Corrupt("metadata block outside metadata file"))
+                sector
+                    .map(|s| s + rel)
+                    .ok_or(Error::Corrupt("metadata block not recorded"))
             }
             MapKind::Virtual(vat) => {
                 let phys = *vat
@@ -464,7 +469,7 @@ impl<'a, S: ByteSource> Udf<'a, S> {
         part_idx: usize,
         phys_ref: u16,
         file_loc: u32,
-    ) -> Result<Vec<(u32, Option<u64>)>> {
+    ) -> Result<Vec<(u64, u32, Option<u64>)>> {
         let sector = self.parts[part_idx].start as u64 + file_loc as u64;
         let blk = self.read_block(sector)?;
         let inode = match tag_id(&blk) {
@@ -473,10 +478,18 @@ impl<'a, S: ByteSource> Udf<'a, S> {
             _ => return Err(Error::Corrupt("metadata file entry")),
         };
         let bs = self.bs;
-        let extents: Vec<(u32, Option<u64>)> = inode
+        // Every extent is at least one block long (parse_ads stops at length 0),
+        // so the first blocks are strictly increasing.
+        let mut first = 0u64;
+        let extents: Vec<(u64, u32, Option<u64>)> = inode
             .extents
             .iter()
-            .map(|e| (e.len.div_ceil(bs), e.recorded.then_some(e.sector)))
+            .map(|e| {
+                let blocks = e.len.div_ceil(bs);
+                let item = (first, blocks, e.recorded.then_some(e.sector));
+                first += blocks as u64;
+                item
+            })
             .collect();
         if extents.is_empty() {
             return Err(Error::Corrupt("empty metadata file"));
@@ -509,25 +522,34 @@ impl<'a, S: ByteSource> Udf<'a, S> {
         Err(Error::Unsupported("virtual partition without VAT"))
     }
 
-    fn read_inode(&mut self, icb: Icb) -> Result<Inode> {
+    /// Reads the File Entry or Extended File Entry at `icb`, following
+    /// strategy-4096 Indirect Entries. Returns the block, the ICB it was found
+    /// at, and its layout.
+    fn file_entry(&mut self, icb: Icb) -> Result<(Vec<u8>, Icb, &'static FeLayout)> {
         let mut icb = icb;
         for _ in 0..4 {
             let sector = self.sector_of(icb.block, icb.part)?;
             let blk = self.read_block(sector)?;
             match tag_id(&blk) {
-                Some(TAG_FE) => return self.parse_fe(&blk, icb.part, &FE_LAYOUT),
-                Some(TAG_EFE) => return self.parse_fe(&blk, icb.part, &EFE_LAYOUT),
+                Some(TAG_FE) => return Ok((blk, icb, &FE_LAYOUT)),
+                Some(TAG_EFE) => return Ok((blk, icb, &EFE_LAYOUT)),
                 Some(TAG_IE) => {
-                    // Indirect entry (strategy 4096): follow to the real entry.
+                    // Indirect entry: the Indirect ICB long_ad at byte 36 points
+                    // at the real entry (its lb_addr starts at byte 40).
                     icb = Icb {
-                        block: u32le(&blk, 20)?,
-                        part: u16le(&blk, 24)?,
+                        block: u32le(&blk, 40)?,
+                        part: u16le(&blk, 44)?,
                     };
                 }
                 _ => return Err(Error::Corrupt("expected file entry")),
             }
         }
         Err(Error::Corrupt("indirect entry chain too long"))
+    }
+
+    fn read_inode(&mut self, icb: Icb) -> Result<Inode> {
+        let (blk, icb, layout) = self.file_entry(icb)?;
+        self.parse_fe(&blk, icb.part, layout)
     }
 
     fn parse_fe(&mut self, blk: &[u8], part: u16, layout: &FeLayout) -> Result<Inode> {
@@ -715,7 +737,10 @@ impl<S: ByteSource> FileSystem for Udf<'_, S> {
     }
 
     fn file_size(&mut self, file: &Icb) -> Result<u64> {
-        Ok(self.read_inode(*file)?.size)
+        // Information Length only (byte 56 in both FE and EFE): allocation
+        // descriptors are parsed just for the file that is actually read.
+        let (blk, _, _) = self.file_entry(*file)?;
+        u64le(&blk, 56)
     }
 
     fn read(&mut self, file: &Icb, max_len: usize) -> Result<Vec<u8>> {

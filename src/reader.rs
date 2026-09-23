@@ -3,8 +3,9 @@
 //! Blu-ray images are tens of gigabytes, so everything is read on demand in
 //! small aligned chunks. The cache keeps the handful of sectors that the
 //! volume/directory walk touches repeatedly (volume descriptors, file entries).
-//! The budget bounds the total amount of data one extraction may pull from an
-//! image, so a crafted image cannot keep the handler reading for long.
+//! The budgets bound the total amount of data and the number of separate reads
+//! one extraction may issue, so a crafted image cannot keep the handler reading
+//! for long.
 
 use crate::error::{Error, Result};
 use std::io::{Read, Seek, SeekFrom};
@@ -25,6 +26,10 @@ const SLOTS: usize = 16;
 /// Default upper bound on the bytes fetched from one image
 /// (artwork + directories + volume structures).
 pub const READ_BUDGET: u64 = 32 << 20;
+/// Upper bound on separate reads issued to the source. On hard disks and
+/// network shares the time goes into seeks, which the byte budget alone does
+/// not bound; a real disc needs about ten.
+pub const MAX_SOURCE_READS: u32 = 256;
 
 struct Slot {
     offset: u64,
@@ -79,10 +84,10 @@ impl<S: ByteSource> CachedReader<S> {
         Ok(())
     }
 
-    /// Accounts `len` bytes against the budget before they are read.
+    /// Accounts one read of `len` bytes against the budgets before it is issued.
     fn charge(&mut self, len: usize) -> Result<()> {
         let total = self.bytes.saturating_add(len as u64);
-        if total > self.budget {
+        if total > self.budget || self.reads >= MAX_SOURCE_READS {
             return Err(Error::TooLarge);
         }
         self.bytes = total;
