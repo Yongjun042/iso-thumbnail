@@ -101,8 +101,13 @@ fn unregister_in(scope: Option<Scope>) -> HRESULT {
             let machine = registry::unregister(Scope::Machine);
             let user = registry::unregister(Scope::User);
             match (machine, user) {
-                (Ok(_), Ok(_)) | (Err(_), Ok(true)) => S_OK,
-                (Err(e), Ok(false)) | (Ok(_), Err(e)) | (Err(e), Err(_)) => e.code(),
+                (_, Err(e)) => e.code(),
+                // Without elevation HKLM cannot be touched: removing the
+                // per-user registration is the whole job then. Any other
+                // machine-wide failure is reported.
+                (Err(e), Ok(true)) if registry::is_access_denied(&e) => S_OK,
+                (Err(e), Ok(_)) => e.code(),
+                (Ok(_), Ok(_)) => S_OK,
             }
         }
     }

@@ -107,6 +107,8 @@ isopreview-cli movie.iso --mode shell --size 256
 등록 상태까지 함께 확인할 수 있습니다.
 
 `isopreview-cli --install`, `--install-machine`, `--uninstall`은 설치 스크립트가 내부적으로 쓰는 등록 명령입니다.
+`--uninstall`은 현재 사용자와 시스템 전체 등록을 모두 해제하며, 하나라도 해제하지 못하면(관리자 권한 없이 시스템 전체
+등록을 만난 경우 포함) 종료 코드 1을 돌려줍니다.
 
 ## 동작 원리
 

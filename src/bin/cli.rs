@@ -334,8 +334,11 @@ fn run_install(scope: Scope, dll: Option<&Path>) -> ExitCode {
     }
 }
 
+/// Fails (exit code 1) when any registration could not be removed, so the
+/// uninstall scripts never delete the files behind a registration that stays.
 fn run_uninstall() -> ExitCode {
     let mut removed = false;
+    let mut failed = false;
     for scope in [Scope::User, Scope::Machine] {
         match registry::unregister(scope) {
             Ok(true) => {
@@ -343,11 +346,20 @@ fn run_uninstall() -> ExitCode {
                 removed = true;
             }
             Ok(false) => {}
-            Err(e) if scope == Scope::Machine && registry::is_access_denied(&e) => {
-                eprintln!("a machine-wide registration exists; remove it from an elevated prompt");
+            Err(e) => {
+                failed = true;
+                if scope == Scope::Machine && registry::is_access_denied(&e) {
+                    eprintln!(
+                        "a machine-wide registration exists; remove it from an elevated prompt"
+                    );
+                } else {
+                    eprintln!("{scope:?}: {e}");
+                }
             }
-            Err(e) => eprintln!("{scope:?}: {e}"),
         }
+    }
+    if failed {
+        return ExitCode::from(1);
     }
     if !removed {
         println!("nothing to remove");
