@@ -34,9 +34,20 @@ pub trait FileSystem {
     /// Reads a whole file, failing with `TooLarge` above `max_len` bytes.
     fn read(&mut self, file: &Self::Node, max_len: usize) -> Result<Vec<u8>>;
 
+    /// Reads up to `buf.len()` bytes of `file` starting at byte `offset` and
+    /// returns how many were read: fewer only when the file ends first (0 at or
+    /// past the end). Parts of the file that are allocated but not recorded
+    /// read as zeros. Fails for directories.
+    fn read_range(&mut self, file: &Self::Node, offset: u64, buf: &mut [u8]) -> Result<usize>;
+
     /// Finds the first entry called `name` (ASCII case-insensitive) of the
     /// requested kind, without materialising the rest of the directory.
-    fn lookup(&mut self, dir: &Self::Node, name: &str, want_dir: bool) -> Result<Option<Self::Node>> {
+    fn lookup(
+        &mut self,
+        dir: &Self::Node,
+        name: &str,
+        want_dir: bool,
+    ) -> Result<Option<Self::Node>> {
         let mut found = None;
         self.walk(dir, &mut |e| {
             if e.is_dir == want_dir && e.name.eq_ignore_ascii_case(name) {

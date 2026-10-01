@@ -250,8 +250,8 @@ impl IClassFactory_Impl for ClassFactory_Impl {
         } else {
             // An unbalanced unlock must not wrap the count and let the DLL
             // unload under live objects.
-            let _ = SERVER_LOCKS
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            let _ =
+                SERVER_LOCKS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         }
         Ok(())
     }

@@ -48,7 +48,9 @@ fn has_image_ext(name: &str) -> bool {
 
 fn is_cover_name(name: &str) -> bool {
     let (stem, _) = split_ext(name);
-    ROOT_COVER_NAMES.iter().any(|n| stem.eq_ignore_ascii_case(n))
+    ROOT_COVER_NAMES
+        .iter()
+        .any(|n| stem.eq_ignore_ascii_case(n))
 }
 
 /// Extracts `WxH` from names such as `MOVIE_640x360.jpg`.

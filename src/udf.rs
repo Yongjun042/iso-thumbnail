@@ -625,7 +625,11 @@ impl<'a, S: ByteSource> Udf<'a, S> {
                 return Err(Error::TooLarge);
             }
             let recorded = kind == 0;
-            let sector = if recorded { self.sector_of(block, p)? } else { 0 };
+            let sector = if recorded {
+                self.sector_of(block, p)?
+            } else {
+                0
+            };
             out.push(Extent {
                 sector,
                 len,
@@ -749,5 +753,10 @@ impl<S: ByteSource> FileSystem for Udf<'_, S> {
             return Err(Error::Corrupt("is a directory"));
         }
         self.read_data(&inode, max_len)
+    }
+
+    fn read_range(&mut self, file: &Icb, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let _ = (file, offset, buf);
+        Err(Error::Unsupported("read_range is not implemented yet"))
     }
 }

@@ -20,16 +20,17 @@ use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_SUCCESS, WIN32_ERROR,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW,
-    RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ,
-    KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
+    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE,
+    REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
 };
 use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
 
 pub const CLSID_TEXT: &str = "{C767266A-4032-4099-9A92-F91D1FE98122}";
 pub const HANDLER_NAME: &str = "ISO Blu-ray Thumbnail Provider";
 const THUMBNAIL_HANDLER_IID: &str = "{E357FCCD-A995-4576-B01F-234630154E96}";
-const APPROVED_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved";
+const APPROVED_PATH: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved";
 /// File extensions the handler is attached to.
 pub const EXTENSIONS: [&str; 1] = [".iso"];
 

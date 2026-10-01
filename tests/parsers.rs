@@ -116,8 +116,18 @@ fn build_iso9660(joliet: bool) -> Vec<u8> {
             21,
             &[
                 (name("BDMT_ENG.XML;1"), 25, XML.len() as u32, false),
-                (name("COVER_416X240.JPG;1"), 24, JPEG_SMALL.len() as u32, false),
-                (name("COVER_640X360.JPG;1"), 23, JPEG_BIG.len() as u32, false),
+                (
+                    name("COVER_416X240.JPG;1"),
+                    24,
+                    JPEG_SMALL.len() as u32,
+                    false,
+                ),
+                (
+                    name("COVER_640X360.JPG;1"),
+                    23,
+                    JPEG_BIG.len() as u32,
+                    false,
+                ),
             ],
         ),
     );
@@ -323,7 +333,10 @@ fn build_udf(metadata: bool, with_artwork: bool, big_size: Option<u64>) -> Vec<u
 fn assert_big_cover(found: &Extracted, filesystem: &str) {
     assert_eq!(found.filesystem, filesystem);
     assert!(
-        found.thumbnail.path.eq_ignore_ascii_case("BDMV/META/DL/COVER_640x360.jpg"),
+        found
+            .thumbnail
+            .path
+            .eq_ignore_ascii_case("BDMV/META/DL/COVER_640x360.jpg"),
         "picked {}",
         found.thumbnail.path
     );
@@ -387,7 +400,15 @@ fn truncated_images_fail_without_panicking() {
         build_udf(false, true, None),
         build_udf(true, true, None),
     ] {
-        for cut in [1usize, 100, 16 * SECTOR + 7, 19 * SECTOR + 40, 33 * SECTOR, 101 * SECTOR, 257 * SECTOR] {
+        for cut in [
+            1usize,
+            100,
+            16 * SECTOR + 7,
+            19 * SECTOR + 40,
+            33 * SECTOR,
+            101 * SECTOR,
+            257 * SECTOR,
+        ] {
             let cut = cut.min(image.len() - 1);
             let result = extract(&image[..cut]);
             // Below 20 sectors no image has its directories yet; later cuts

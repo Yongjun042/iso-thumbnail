@@ -176,4 +176,9 @@ impl<S: ByteSource> FileSystem for Iso9660<'_, S> {
         self.rd
             .read_vec(file.extent as u64 * SECTOR, file.size as usize)
     }
+
+    fn read_range(&mut self, file: &Node, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let _ = (file, offset, buf);
+        Err(Error::Unsupported("read_range is not implemented yet"))
+    }
 }

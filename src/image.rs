@@ -177,7 +177,9 @@ pub fn decode_to_dib(data: &[u8], max_side: u32) -> Result<Decoded> {
             WICBitmapPaletteTypeCustom,
         )?;
 
-        let stride = tw.checked_mul(4).ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+        let stride = tw
+            .checked_mul(4)
+            .ok_or_else(|| windows::core::Error::from(E_FAIL))?;
         let len = stride as usize * th as usize;
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -209,6 +211,14 @@ pub fn decode_to_dib(data: &[u8], max_side: u32) -> Result<Decoded> {
             has_alpha,
         })
     }
+}
+
+/// Scales a decoded video picture (see `crate::picture`) to fit `max_side`
+/// with its pixel aspect ratio applied, and returns it as a DIB like
+/// `decode_to_dib` (never scaled up beyond its display size; `has_alpha` false).
+pub fn picture_to_dib(picture: &crate::picture::Picture, max_side: u32) -> Result<Decoded> {
+    let _ = (picture, max_side);
+    Err(windows::Win32::Foundation::E_NOTIMPL.into())
 }
 
 #[cfg(test)]
