@@ -9,8 +9,10 @@ extern crate IsoPreview as iso_preview;
 use std::io::Cursor;
 
 use iso_preview::error::Error;
-use iso_preview::reader::{CachedReader, SeekSource};
-use iso_preview::udf::Udf;
+use iso_preview::fs::FileSystem;
+use iso_preview::iso9660::Iso9660;
+use iso_preview::reader::{ByteSource, CachedReader, SeekSource};
+use iso_preview::udf::{Icb, Udf};
 use iso_preview::Extracted;
 
 const SECTOR: usize = 2048;
@@ -515,6 +517,274 @@ fn corrupted_images_never_panic() {
                 copy[off] = next() as u8;
             }
             let _ = extract(&copy);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Ranged reads (FileSystem::read_range)
+// ----------------------------------------------------------------------------
+
+/// Byte `i` of the multi-extent test file.
+fn pattern(i: u64) -> u8 {
+    (i * 7 + i / 251 + 1) as u8
+}
+
+/// Extent kinds of an allocation descriptor (the top two bits of its length).
+const RECORDED: u32 = 0;
+const NOT_RECORDED: u32 = 1;
+const NOT_ALLOCATED: u32 = 2;
+
+/// Replaces the file entry of `BDMV/STREAM/00000.m2ts` (block 14) in a
+/// `build_udf` image with one that has `extents` = (kind, length, block) and
+/// Information Length `size`, writes the pattern into the recorded extents
+/// and returns the image and the file's expected content.
+fn udf_with_extents(metadata: bool, extents: &[(u32, u32, u32)], size: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut img = Image {
+        data: build_udf(metadata, true, None),
+    };
+    let mut ads = Vec::new();
+    let mut expected = vec![0u8; size as usize];
+    let mut pos = 0u64;
+    for &(kind, len, block) in extents {
+        let raw = len | kind << 30;
+        if metadata {
+            ads.extend_from_slice(&long_ad(raw, block, 0));
+        } else {
+            ads.extend_from_slice(&short_ad(raw, block));
+        }
+        let sector = (PART_START + block) as usize;
+        if kind == RECORDED {
+            let data: Vec<u8> = (pos..pos + len as u64).map(pattern).collect();
+            img.put(sector, 0, &data);
+            let end = (pos + len as u64).min(size);
+            if pos < end {
+                expected[pos as usize..end as usize].copy_from_slice(&data[..(end - pos) as usize]);
+            }
+        } else {
+            // Whatever sits in the blocks of an unrecorded extent must not show.
+            img.put(sector, 0, &vec![0xEE; len as usize]);
+        }
+        pos += len as u64;
+    }
+    let (ad_type, base) = if metadata { (1, 30) } else { (0, 0) };
+    let entry = fe(14, 5, size, ad_type, &ads);
+    img.put((PART_START + base + 14) as usize, 0, &entry);
+    (img.data, expected)
+}
+
+fn udf_m2ts<S: ByteSource>(fs: &mut Udf<'_, S>) -> Icb {
+    let root = fs.root().unwrap();
+    let bdmv = fs.lookup(&root, "BDMV", true).unwrap().unwrap();
+    let stream = fs.lookup(&bdmv, "STREAM", true).unwrap().unwrap();
+    fs.lookup(&stream, "00000.m2ts", false).unwrap().unwrap()
+}
+
+/// Reads `len` bytes at `offset` and checks them against `expected` (the
+/// whole file), including that nothing past the returned count is written.
+fn check_range<F: FileSystem>(
+    fs: &mut F,
+    node: &F::Node,
+    expected: &[u8],
+    offset: u64,
+    len: usize,
+) {
+    let mut buf = vec![0xA5u8; len];
+    let n = fs.read_range(node, offset, &mut buf).unwrap();
+    let start = offset.min(expected.len() as u64) as usize;
+    let rest = &expected[start..];
+    let want = &rest[..rest.len().min(len)];
+    assert_eq!(n, want.len(), "count at {offset}+{len}");
+    assert!(buf[..n] == *want, "bytes at {offset}+{len}");
+    assert!(buf[n..].iter().all(|&b| b == 0xA5), "wrote past the count");
+}
+
+#[test]
+fn udf_read_range_follows_the_extents() {
+    let s = SECTOR as u32;
+    // Recorded, allocated but not recorded, recorded, not allocated, a short
+    // last extent; the Information Length reaches 500 bytes past the extents.
+    let extents = [
+        (RECORDED, 2 * s, 60),
+        (NOT_RECORDED, s, 65),
+        (RECORDED, 2 * s, 70),
+        (NOT_ALLOCATED, s, 66),
+        (RECORDED, 1000, 75),
+    ];
+    let size = 6 * SECTOR + 1000 + 500;
+    for metadata in [false, true] {
+        let (image, expected) = udf_with_extents(metadata, &extents, size as u64);
+        assert!(expected[4096..6144].iter().all(|&b| b == 0));
+        assert!(expected[size - 500..].iter().all(|&b| b == 0));
+        let mut rd = CachedReader::new(SeekSource(Cursor::new(image))).unwrap();
+        let mut fs = Udf::open(&mut rd).unwrap();
+        let file = udf_m2ts(&mut fs);
+        assert_eq!(fs.file_size(&file).unwrap(), size as u64);
+        for (offset, len) in [
+            (0, 100),
+            (1, 4095),       // inside the first extent, up to its end
+            (4000, 200),     // recorded → not recorded
+            (6000, 5000),    // across four extents
+            (11_000, 300),   // inside the not-allocated extent
+            (12_288, 1000),  // exactly the short last extent
+            (13_000, 500),   // last extent → zeros past the extents
+            (0, size),       // everything
+            (0, size + 100), // more than the file
+            (size - 10, 100),
+            (size, 10),
+            (size + 5, 10),
+            (100, 0),
+        ] {
+            check_range(&mut fs, &file, &expected, offset as u64, len);
+        }
+        check_range(&mut fs, &file, &expected, u64::MAX, 16);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..300 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let offset = seed % (size as u64 + 64);
+            let len = ((seed >> 32) % 5000) as usize;
+            check_range(&mut fs, &file, &expected, offset, len);
+        }
+        // Directories cannot be read as files.
+        let root = fs.root().unwrap();
+        assert!(fs.read_range(&root, 0, &mut [0u8; 16]).is_err());
+    }
+}
+
+#[test]
+fn udf_read_range_reads_embedded_data() {
+    for metadata in [false, true] {
+        let mut img = Image {
+            data: build_udf(metadata, true, None),
+        };
+        let inline = b"inline file data, 34 bytes long..";
+        // Information Length 40: the bytes beyond the embedded data read as zeros.
+        let base = if metadata { 30 } else { 0 };
+        img.put(
+            (PART_START + base + 14) as usize,
+            0,
+            &fe(14, 5, 40, 3, inline),
+        );
+        let mut expected = inline.to_vec();
+        expected.resize(40, 0);
+        let mut rd = CachedReader::new(SeekSource(Cursor::new(img.data))).unwrap();
+        let mut fs = Udf::open(&mut rd).unwrap();
+        let file = udf_m2ts(&mut fs);
+        for (offset, len) in [
+            (0, 40),
+            (0, 100),
+            (5, 10),
+            (30, 10),
+            (33, 7),
+            (39, 5),
+            (40, 1),
+            (41, 1),
+        ] {
+            check_range(&mut fs, &file, &expected, offset, len);
+        }
+    }
+}
+
+#[test]
+fn udf_read_range_respects_the_read_budget() {
+    let s = SECTOR as u32;
+    let (image, expected) = udf_with_extents(false, &[(RECORDED, 40 * s, 60)], 40 * SECTOR as u64);
+    // First measure what opening the volume and finding the file costs.
+    let used = {
+        let mut rd = CachedReader::new(SeekSource(Cursor::new(image.clone()))).unwrap();
+        let mut fs = Udf::open(&mut rd).unwrap();
+        udf_m2ts(&mut fs);
+        drop(fs);
+        rd.bytes
+    };
+    let budget = used + (40 << 10);
+    let mut rd = CachedReader::with_budget(SeekSource(Cursor::new(image)), budget).unwrap();
+    let mut fs = Udf::open(&mut rd).unwrap();
+    let file = udf_m2ts(&mut fs);
+    check_range(&mut fs, &file, &expected, 0, 100);
+    let mut whole = vec![0u8; expected.len()];
+    assert_eq!(fs.read_range(&file, 0, &mut whole), Err(Error::TooLarge));
+}
+
+#[test]
+fn iso9660_read_range_reads_the_extent() {
+    for joliet in [false, true] {
+        let image = build_iso9660(joliet);
+        let mut rd = CachedReader::new(SeekSource(Cursor::new(image))).unwrap();
+        let mut fs = Iso9660::open(&mut rd).unwrap();
+        let mut dir = fs.root().unwrap();
+        for name in ["BDMV", "META", "DL"] {
+            dir = fs.lookup(&dir, name, true).unwrap().unwrap();
+        }
+        let file = fs
+            .lookup(&dir, "COVER_640X360.JPG", false)
+            .unwrap()
+            .unwrap();
+        let n = JPEG_BIG.len();
+        for (offset, len) in [
+            (0, n),
+            (0, 4),
+            (3, 10),
+            (n - 1, 5),
+            (n, 1),
+            (n + 100, 1),
+            (0, 4096),
+        ] {
+            check_range(&mut fs, &file, JPEG_BIG, offset as u64, len);
+        }
+        check_range(&mut fs, &file, JPEG_BIG, u64::MAX, 3);
+        assert!(fs.read_range(&dir, 0, &mut [0u8; 8]).is_err());
+    }
+}
+
+/// Corrupting the file entry (sizes, allocation descriptors) must give an
+/// error or a short read, never a panic or a count beyond the buffer.
+#[test]
+fn udf_read_range_survives_corrupt_file_entries() {
+    let s = SECTOR as u32;
+    let extents = [
+        (RECORDED, 2 * s, 60),
+        (NOT_RECORDED, s, 65),
+        (RECORDED, 1000, 70),
+    ];
+    let mut seed: u64 = 0x1F2E_3D4C_5B6A_7988;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for metadata in [false, true] {
+        let (image, _) = udf_with_extents(metadata, &extents, 4 * SECTOR as u64);
+        let fe_at = (PART_START + if metadata { 44 } else { 14 }) as usize * SECTOR;
+        for _ in 0..400 {
+            let mut copy = image.clone();
+            for _ in 0..1 + next() % 4 {
+                // Information Length (56..64) and the descriptors (176..)
+                // matter most; the tag checksum is recomputed below.
+                let off = match next() % 3 {
+                    0 => 56 + (next() % 8) as usize,
+                    1 => 168 + (next() % 8) as usize,
+                    _ => 176 + (next() % 48) as usize,
+                };
+                copy[fe_at + off] = next() as u8;
+            }
+            let mut sum = 0u8;
+            for i in (0..16).filter(|&i| i != 4) {
+                sum = sum.wrapping_add(copy[fe_at + i]);
+            }
+            copy[fe_at + 4] = sum;
+            let mut rd = CachedReader::new(SeekSource(Cursor::new(copy))).unwrap();
+            let mut fs = Udf::open(&mut rd).unwrap();
+            let file = udf_m2ts(&mut fs);
+            let mut buf = vec![0u8; 3000];
+            for offset in [0u64, 4000, 1 << 40, u64::MAX - 10] {
+                if let Ok(n) = fs.read_range(&file, offset, &mut buf) {
+                    assert!(n <= buf.len());
+                }
+            }
         }
     }
 }

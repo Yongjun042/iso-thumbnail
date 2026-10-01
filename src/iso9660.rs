@@ -178,7 +178,17 @@ impl<S: ByteSource> FileSystem for Iso9660<'_, S> {
     }
 
     fn read_range(&mut self, file: &Node, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let _ = (file, offset, buf);
-        Err(Error::Unsupported("read_range is not implemented yet"))
+        if file.is_dir {
+            return Err(Error::Corrupt("is a directory"));
+        }
+        let size = file.size as u64;
+        if offset >= size {
+            return Ok(0);
+        }
+        // Both terms are below 2^43, so the sum cannot overflow.
+        let n = (size - offset).min(buf.len() as u64) as usize;
+        let at = file.extent as u64 * SECTOR + offset;
+        self.rd.read_exact(at, &mut buf[..n])?;
+        Ok(n)
     }
 }

@@ -670,6 +670,62 @@ impl<'a, S: ByteSource> Udf<'a, S> {
         out.truncate(pos);
         Ok(out)
     }
+
+    /// Fills `buf` with the bytes of `inode` from `offset` on, clipped to the
+    /// Information Length, and returns how many bytes that is. Extents are
+    /// consecutive in the file; unrecorded extents and whatever lies past the
+    /// last extent (or past the embedded data) read as zeros. Only the
+    /// requested range is touched, so the cost does not grow with the file.
+    fn read_inode_range(&mut self, inode: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        if offset >= inode.size {
+            return Ok(0);
+        }
+        let left = inode.size - offset;
+        let n = usize::try_from(left).map_or(buf.len(), |left| left.min(buf.len()));
+        let out = &mut buf[..n];
+        if let Some(embedded) = &inode.embedded {
+            let tail = usize::try_from(offset)
+                .ok()
+                .and_then(|start| embedded.get(start..))
+                .unwrap_or(&[]);
+            let k = tail.len().min(n);
+            out[..k].copy_from_slice(&tail[..k]);
+            out[k..].fill(0);
+            return Ok(n);
+        }
+        let bs = self.bs as u64;
+        let end = offset.saturating_add(n as u64);
+        // File offset of the current extent; at most MAX_EXTENTS * 1 GiB.
+        let mut ext_start = 0u64;
+        let mut pos = offset;
+        for ext in &inode.extents {
+            if pos >= end {
+                break;
+            }
+            let ext_end = ext_start.saturating_add(ext.len as u64);
+            if pos < ext_end {
+                let within = pos.saturating_sub(ext_start);
+                let k = (ext_end.min(end) - pos) as usize;
+                let done = (pos - offset) as usize;
+                let dst = &mut out[done..done + k];
+                if ext.recorded {
+                    let at = ext
+                        .sector
+                        .checked_mul(bs)
+                        .and_then(|o| o.checked_add(within))
+                        .ok_or(Error::Corrupt("sector overflow"))?;
+                    self.rd.read_exact(at, dst)?;
+                } else {
+                    dst.fill(0);
+                }
+                pos += k as u64;
+            }
+            ext_start = ext_end;
+        }
+        let done = (pos - offset) as usize;
+        out[done..].fill(0);
+        Ok(n)
+    }
 }
 
 impl<S: ByteSource> FileSystem for Udf<'_, S> {
@@ -756,7 +812,13 @@ impl<S: ByteSource> FileSystem for Udf<'_, S> {
     }
 
     fn read_range(&mut self, file: &Icb, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let _ = (file, offset, buf);
-        Err(Error::Unsupported("read_range is not implemented yet"))
+        // The file entry and its allocation descriptors are parsed on every
+        // call (normally one cached block); the file data itself is only read
+        // for the requested range, so a 1 GiB VOB costs no more than a small file.
+        let inode = self.read_inode(*file)?;
+        if inode.file_type == FT_DIRECTORY {
+            return Err(Error::Corrupt("is a directory"));
+        }
+        self.read_inode_range(&inode, offset, buf)
     }
 }
