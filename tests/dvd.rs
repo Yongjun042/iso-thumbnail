@@ -692,3 +692,393 @@ fn partly_scrambled_titles_give_no_frame() {
         assert_eq!(result.err(), Some(Error::NotFound), "{fs}");
     });
 }
+
+// ----------------------------------------------------------------------------
+// Menus described by IFO files
+// ----------------------------------------------------------------------------
+
+/// An IFO file (`kind` "VMG" or "VTS") whose menu PGCI unit table holds one
+/// language unit with an entry PGC per `(menu id, first VOBU, last VOBU)`,
+/// each with one cell. Menu ids: 2 title, 3 root, 5 audio.
+fn menu_ifo(kind: &str, menus: &[(u8, u32, u32)]) -> Vec<u8> {
+    let mut header = ifo(kind);
+    let pointer = if kind == "VMG" { 0xC8 } else { 0xD0 };
+    header[pointer..pointer + 4].copy_from_slice(&1u32.to_be_bytes());
+    // One PGC per menu: 0xEC bytes of PGC fields, then one 24-byte cell.
+    let pgc_len = 0xEC + 24;
+    let unit_head = 8 + 8 * menus.len();
+    let mut unit = vec![0u8; unit_head];
+    unit[0..2].copy_from_slice(&(menus.len() as u16).to_be_bytes());
+    for (n, &(id, _, _)) in menus.iter().enumerate() {
+        unit[8 + n * 8] = 0x80 | id;
+        let at = (unit_head + n * pgc_len) as u32;
+        unit[8 + n * 8 + 4..8 + n * 8 + 8].copy_from_slice(&at.to_be_bytes());
+    }
+    for &(_, first, last) in menus {
+        let mut pgc = vec![0u8; pgc_len];
+        pgc[2] = 1; // programs
+        pgc[3] = 1; // cells
+        pgc[0xE8..0xEA].copy_from_slice(&0xECu16.to_be_bytes());
+        pgc[0xEC + 8..0xEC + 12].copy_from_slice(&first.to_be_bytes());
+        pgc[0xEC + 16..0xEC + 20].copy_from_slice(&last.to_be_bytes());
+        unit.extend(pgc);
+    }
+    let unit_last = (unit.len() - 1) as u32;
+    unit[4..8].copy_from_slice(&unit_last.to_be_bytes());
+    let mut table = vec![0u8; 16];
+    table[0..2].copy_from_slice(&1u16.to_be_bytes());
+    table[8..10].copy_from_slice(b"en");
+    table[11] = 0x80;
+    table[12..16].copy_from_slice(&16u32.to_be_bytes());
+    table.extend(unit);
+    let table_last = (table.len() - 1) as u32;
+    table[4..8].copy_from_slice(&table_last.to_be_bytes());
+    header.extend(table);
+    header
+}
+
+/// Concatenates VOBs (each a whole number of packs) and returns the result
+/// with the sector where each part starts.
+fn concat(parts: &[Vec<u8>]) -> (Vec<u8>, Vec<u32>) {
+    let mut out = Vec::new();
+    let mut starts = Vec::new();
+    for p in parts {
+        assert_eq!(p.len() % SECTOR, 0);
+        starts.push((out.len() / SECTOR) as u32);
+        out.extend_from_slice(p);
+    }
+    (out, starts)
+}
+
+fn is_green(p: &Picture) -> bool {
+    let (b, g, r) = average(p);
+    g > b + 20 && g > r + 20
+}
+
+const GREEN: Look = Look::Checker(70, 70);
+
+#[test]
+fn the_root_menu_comes_before_title_frames() {
+    // The menu VOB holds an audio menu (blue) and then the root menu (red);
+    // the title is green.
+    let (menu_vob, starts) = concat(&[vob(&[BLUE; 2], 500, false), vob(&[RED; 2], 500, false)]);
+    let last = (menu_vob.len() / SECTOR - 1) as u32;
+    let files = vec![
+        ("VIDEO_TS/VIDEO_TS.IFO", ifo("VMG")),
+        (
+            "VIDEO_TS/VTS_01_0.IFO",
+            menu_ifo("VTS", &[(5, starts[0], starts[0]), (3, starts[1], last)]),
+        ),
+        ("VIDEO_TS/VTS_01_0.VOB", menu_vob),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[GREEN; 8], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(
+            found.thumbnail.path, "VIDEO_TS/VTS_01_0.VOB (root menu)",
+            "{fs}"
+        );
+        assert!(
+            is_red(picture(&found)),
+            "{fs}: {:?}",
+            average(picture(&found))
+        );
+    });
+}
+
+#[test]
+fn a_motion_menu_is_looked_at_where_it_settles() {
+    // The root menu fades in from black: its first VOBU is black, its last
+    // one shows the menu.
+    let (menu_vob, starts) = concat(&[
+        vob(&[Look::Black; 3], 500, false),
+        vob(&[RED; 2], 500, false),
+    ]);
+    let files = vec![
+        (
+            "VIDEO_TS/VTS_01_0.IFO",
+            menu_ifo("VTS", &[(3, starts[0], starts[1])]),
+        ),
+        ("VIDEO_TS/VTS_01_0.VOB", menu_vob),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[GREEN; 8], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(
+            found.thumbnail.path, "VIDEO_TS/VTS_01_0.VOB (root menu)",
+            "{fs}"
+        );
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn the_title_menu_is_used_without_a_root_menu() {
+    // The video manager VOB starts with a warning (flat) before its title
+    // menu (red); the main title set has no menus at all.
+    let (vmg_vob, starts) = concat(&[
+        vob(&[Look::Flat; 2], 500, false),
+        vob(&[RED; 2], 500, false),
+    ]);
+    let files = vec![
+        (
+            "VIDEO_TS/VIDEO_TS.IFO",
+            menu_ifo("VMG", &[(2, starts[1], starts[1])]),
+        ),
+        ("VIDEO_TS/VIDEO_TS.VOB", vmg_vob),
+        ("VIDEO_TS/VTS_01_0.IFO", ifo("VTS")),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[GREEN; 8], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(
+            found.thumbnail.path, "VIDEO_TS/VIDEO_TS.VOB (title menu)",
+            "{fs}"
+        );
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn a_damaged_ifo_falls_back_to_its_backup() {
+    let (menu_vob, starts) = concat(&[vob(&[BLUE; 2], 500, false), vob(&[RED; 2], 500, false)]);
+    let good = menu_ifo("VTS", &[(3, starts[1], starts[1])]);
+    let mut bad = good.clone();
+    bad[..12].copy_from_slice(b"garbage-data");
+    let files = vec![
+        ("VIDEO_TS/VTS_01_0.IFO", bad),
+        ("VIDEO_TS/VTS_01_0.BUP", good),
+        ("VIDEO_TS/VTS_01_0.VOB", menu_vob),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[GREEN; 8], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert!(found.thumbnail.path.ends_with("(root menu)"), "{fs}");
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn a_dark_menu_gives_way_to_a_title_frame() {
+    let (menu_vob, starts) = concat(&[vob(&[Look::Black; 2], 500, false)]);
+    let files = vec![
+        (
+            "VIDEO_TS/VTS_01_0.IFO",
+            menu_ifo("VTS", &[(3, starts[0], starts[0])]),
+        ),
+        ("VIDEO_TS/VTS_01_0.VOB", menu_vob),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[GREEN; 8], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let path = &found.thumbnail.path;
+        assert!(path.contains("title at"), "{fs}: {path}");
+        assert!(is_green(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn menu_positions_outside_the_vob_are_ignored() {
+    let files = vec![
+        (
+            "VIDEO_TS/VTS_01_0.IFO",
+            menu_ifo("VTS", &[(3, 1_000_000, 2_000_000)]),
+        ),
+        ("VIDEO_TS/VTS_01_0.VOB", vob(&[RED; 2], 500, false)),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[GREEN; 8], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert!(is_green(picture(&found)), "{fs}: {}", found.thumbnail.path);
+    });
+}
+
+#[test]
+fn damaged_ifos_never_panic() {
+    let (menu_vob, starts) = concat(&[vob(&[BLUE; 2], 300, false), vob(&[RED; 2], 300, false)]);
+    let base = menu_ifo(
+        "VTS",
+        &[(5, starts[0], starts[0]), (3, starts[1], starts[1])],
+    );
+    let title = vob(&[GREEN; 3], 500, false);
+    let mut seed = 0xC0FF_EE11_D00D_F00Du64;
+    for round in 0..150 {
+        let mut ifo_bytes = base.clone();
+        for _ in 0..(1 + round % 12) {
+            let r = mpeg2_writer::xorshift(&mut seed) as usize;
+            // Mostly the table (from 2048 on), sometimes the header.
+            let at = if r % 4 == 0 {
+                r % 256
+            } else {
+                2048 + (r >> 8) % (ifo_bytes.len() - 2048)
+            };
+            ifo_bytes[at] = (r >> 40) as u8;
+        }
+        if round % 9 == 0 {
+            let keep = mpeg2_writer::xorshift(&mut seed) as usize % ifo_bytes.len();
+            ifo_bytes.truncate(keep);
+        }
+        let files = vec![
+            ("VIDEO_TS/VTS_01_0.IFO", ifo_bytes),
+            ("VIDEO_TS/VTS_01_0.VOB", menu_vob.clone()),
+            ("VIDEO_TS/VTS_01_1.VOB", title.clone()),
+        ];
+        on_every_file_system(&files, |fs, result| {
+            // Whatever the IFO says, a picture comes out: a menu or the title.
+            assert!(result.is_ok(), "{fs}: {:?}", result.err());
+        });
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Second review round
+// ----------------------------------------------------------------------------
+
+#[test]
+fn an_unreadable_video_ts_is_not_a_crash() {
+    // The VIDEO_TS directory record claims 5 MiB, more than a directory may
+    // be: the walk fails, and the search must give up quietly.
+    let files = [
+        ("VIDEO_TS/VIDEO_TS.VOB", vob(&[RED; 2], 500, false)),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[BLUE; 4], 3000, false)),
+    ];
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+    let mut image = iso9660(&files);
+    let root = 18 * SECTOR;
+    let at = image[root..root + SECTOR]
+        .windows(8)
+        .position(|w| w == b"VIDEO_TS")
+        .expect("VIDEO_TS record")
+        + root
+        - 33;
+    let size = 5u32 << 20;
+    image[at + 10..at + 14].copy_from_slice(&size.to_le_bytes());
+    image[at + 14..at + 18].copy_from_slice(&size.to_be_bytes());
+    assert_eq!(extract(&image).err(), Some(Error::NotFound));
+}
+
+#[test]
+fn an_undecodable_main_title_leaves_room_for_the_next_title_set() {
+    let unit = empty_picture(720, 480);
+    let junk: Vec<u8> = unit
+        .iter()
+        .copied()
+        .cycle()
+        .take(unit.len() * 60_000)
+        .collect();
+    let files = vec![
+        ("VIDEO_TS/VTS_01_1.VOB", dense_vob(&junk)),
+        ("VIDEO_TS/VTS_02_1.VOB", vob(&[RED; 6], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let path = &found.thumbnail.path;
+        assert!(path.contains("VTS_02"), "{fs}: {path}");
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn an_unreadable_title_vob_does_not_count_as_searched() {
+    use iso_preview::finder::find_thumbnail;
+    let title = vob(&[RED; 4], 3000, false);
+    let files: [(&str, &[u8]); 1] = [("VIDEO_TS/VTS_01_1.VOB", &title)];
+    let mut image = udf102(&files, UdfOptions::default());
+    // Healthy: the title VOB is read, so the search counts as done.
+    let mut rd = reader(image.clone());
+    let mut fs = Udf::open(&mut rd).unwrap();
+    let mut searched = false;
+    assert!(find_thumbnail(&mut fs, &mut searched).is_ok());
+    assert!(searched);
+    // Break the File Entry of the title VOB (its tag checksum): its size
+    // cannot be read, so another view of the disc must still be searched.
+    let fe = image
+        .chunks_exact(SECTOR)
+        .position(|s| {
+            s[0..2] == 261u16.to_le_bytes() && s[56..64] == (title.len() as u64).to_le_bytes()
+        })
+        .expect("file entry of the title VOB");
+    image[fe * SECTOR + 4] ^= 0xFF;
+    let mut rd = reader(image);
+    let mut fs = Udf::open(&mut rd).unwrap();
+    let mut searched = false;
+    assert_eq!(
+        find_thumbnail(&mut fs, &mut searched).err(),
+        Some(Error::NotFound)
+    );
+    assert!(!searched);
+}
+
+#[test]
+fn sparsely_scrambled_titles_still_give_a_frame() {
+    // One pack in 20 is scrambled, so every read chunk has holes: the whole
+    // pictures between them are used.
+    let es = title_es(&[BLUE; 120], 3000, false);
+    let clear = plain_vob(&es);
+    let scrambled = mux(
+        &es,
+        &PsOptions {
+            scrambled: true,
+            end_code: false,
+            ..PsOptions::default()
+        },
+    )
+    .data;
+    let mut mixed = clear.clone();
+    for (i, pack) in mixed.chunks_exact_mut(SECTOR).enumerate() {
+        if i % 20 == 19 {
+            pack.copy_from_slice(&scrambled[i * SECTOR..(i + 1) * SECTOR]);
+        }
+    }
+    let files = vec![("VIDEO_TS/VTS_01_1.VOB", mixed)];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert!(is_blue(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn pictures_larger_than_dvd_are_not_decoded() {
+    // A DVD-sized sequence header followed by an HD one that the I-picture
+    // actually uses: the size check must look at the second. The picture is
+    // terminated, so it is decoded as found, from the first header on.
+    let c = cfg(false);
+    let mut es = mpeg2_writer::sequence_headers(&c, 720, 480);
+    es.extend(intra_picture(&c, 1280, 720, |x, y| RED.color(x, y)));
+    es.extend_from_slice(&mpeg2_writer::SEQUENCE_END);
+    let files = vec![("VIDEO_TS/VTS_01_1.VOB", plain_vob(&es))];
+    on_every_file_system(&files, |fs, result| {
+        assert_eq!(result.err(), Some(Error::NotFound), "{fs}");
+    });
+}
+
+#[test]
+fn a_truncated_last_picture_is_not_used() {
+    let mut c = cfg(false);
+    c.sequence_end = false;
+    let picture_es = intra_picture(&c, W, H, |x, y| RED.color(x, y));
+    // A few percent missing: few enough to pass the damage limit, so only
+    // the end-of-file rule keeps the grey rows out.
+    let cut = &picture_es[..picture_es.len() * 97 / 100];
+    let files = vec![("VIDEO_TS/VTS_01_1.VOB", plain_vob(cut))];
+    on_every_file_system(&files, |fs, result| {
+        assert_eq!(result.err(), Some(Error::NotFound), "{fs}");
+    });
+}
+
+#[test]
+fn a_dark_title_gives_way_to_a_menu_without_ifo() {
+    let files = vec![
+        ("VIDEO_TS/VIDEO_TS.VOB", vob(&[RED; 2], 500, false)),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[Look::Black; 8], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert!(
+            found.thumbnail.path.contains("(menu)"),
+            "{fs}: {}",
+            found.thumbnail.path
+        );
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}

@@ -352,14 +352,13 @@ pub fn pixel_aspect(
     let (pw, ph) = (u64::from(picture.0), u64::from(picture.1));
     let (dw, dh) = match display_size {
         Some((w, h)) if w != 0 && h != 0 => {
-            let (w, h) = (u64::from(w), u64::from(h));
             // Whole-picture shape with the display-based sample aspect:
-            // DAR × (h / w) × (pw / ph) = num / den. Every factor is below
-            // 2^14 (sizes) or 222 (DAR terms), so nothing overflows.
-            let num = dar_w * h * pw;
-            let den = dar_h * w * ph;
+            // DAR × (h / w) × (pw / ph) = num / den, in u128 so that any u32
+            // input is safe (streams give at most 14-bit sizes).
+            let num = u128::from(dar_w) * u128::from(h) * u128::from(pw);
+            let den = u128::from(dar_h) * u128::from(w) * u128::from(ph);
             if num * 3 == den * 4 || num * 9 == den * 16 {
-                (w, h)
+                (u64::from(w), u64::from(h))
             } else {
                 (pw, ph)
             }

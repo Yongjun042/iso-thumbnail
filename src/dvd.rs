@@ -1,29 +1,42 @@
 //! DVD-Video support: jacket pictures and frames from the main title.
 //!
 //! A DVD carries no thumbnail file the way a Blu-ray does (`BDMV/META/DL`).
-//! Two sources are used instead:
+//! These sources are used instead, in this order:
 //! 1. `JACKET_P/J00___5L.MP2` (or the `5M`/`5S` sizes): the jacket picture, an
 //!    MPEG-2 still picture authored for players' disc browsers. Mostly found on
-//!    Japanese discs. The finder prefers it over everything but Blu-ray artwork.
-//! 2. An I-frame of the main title, taken as the title set (`VTS_nn_1..9.VOB`)
-//!    holding the most data. A few positions are sampled; frames that are
-//!    nearly black, washed out or flat (fades, logos, title cards) are passed
-//!    over, and black letterbox or pillarbox bars are cut off. The menu VOBs
-//!    (`VIDEO_TS.VOB`, `VTS_nn_0.VOB`) are the last resort.
+//!    Japanese discs. The finder prefers it over everything but Blu-ray artwork
+//!    (`jacket_picture`); the rest is `video_picture`.
+//! 2. The disc's menus as its IFO files describe them (see `crate::ifo`): the
+//!    root menu (main menu) of the main title set, then the video manager's
+//!    title menu. Each is looked at where its first cell starts and, for a
+//!    motion menu whose opening animation starts dark, where the cell's last
+//!    VOBU starts.
+//! 3. An I-frame of the main title, taken as the title set (`VTS_nn_1..9.VOB`)
+//!    holding the most data, when no menu gave a presentable picture. A few
+//!    positions are sampled.
+//! 4. The first picture of the menu VOBs (`VIDEO_TS.VOB`, `VTS_nn_0.VOB`)
+//!    without IFO information: the last resort, since a video manager VOB often
+//!    starts with a warning or a studio logo.
+//!
+//! Throughout, frames that are nearly black, washed out or flat (fades, logos,
+//! title cards) are passed over unless nothing better turns up, and black
+//! letterbox or pillarbox bars are cut off.
 //!
 //! Scrambled (CSS) video packets are skipped, never decrypted: a title whose
 //! video is scrambled yields no frame (its menus may still be unscrambled).
 //!
 //! Work is bounded on every axis, also for crafted images: all reads go
 //! through the image's `CachedReader` budgets; each sampling attempt scans at
-//! most `MAX_SCAN_BYTES`; there are at most `MAX_TITLE_ATTEMPTS` title and
-//! `MAX_MENUS` menu attempts; and every `decode_intra` call counts against
-//! `MAX_DECODES_PER_GRAB` and the per-disc `TITLE_DECODES` / `MENU_DECODES`,
-//! failed ones included. Pictures larger than DVD-Video allows are not
-//! decoded at all.
+//! most `MENU_SCAN_BYTES` (menus at known positions) or `MAX_SCAN_BYTES`; there
+//! are at most `MAX_AUTHORED_MENU_ATTEMPTS`, `MAX_TITLE_ATTEMPTS` and
+//! `MAX_MENUS` attempts in the three video phases; and every `decode_intra`
+//! call counts against `MAX_DECODES_PER_GRAB` and the per-disc allowance of
+//! its phase, failed ones included. Pictures larger than DVD-Video allows are
+//! not decoded at all.
 
 use crate::finder::{Content, Thumbnail};
 use crate::fs::FileSystem;
+use crate::ifo::{self, Menu};
 use crate::mpeg2::{self, Frame};
 use crate::mpegps::{self, Demuxer};
 use crate::picture::{self, LumaStats, Rect};
@@ -37,6 +50,14 @@ const READ_CHUNK: usize = 256 << 10;
 /// 1.3 MB at DVD's highest mux rate, so this always reaches the next
 /// I-frame and the end of that picture.
 const MAX_SCAN_BYTES: u64 = 2 << 20;
+/// Most bytes scanned from a menu position the IFO gave: the I-picture starts
+/// right there, after the VOBU's navigation pack.
+const MENU_SCAN_BYTES: u64 = 1 << 20;
+/// Most attempts at the menus the IFO files describe (two menus, two
+/// positions each).
+const MAX_AUTHORED_MENU_ATTEMPTS: usize = 4;
+/// Most `decode_intra` calls for all those attempts.
+const AUTHORED_MENU_DECODES: usize = 8;
 /// Most elementary stream bytes buffered while waiting for an I-picture to
 /// complete. DVD I-pictures are well below 1 MiB.
 const MAX_ES_BYTES: usize = 2 << 20;
@@ -55,8 +76,10 @@ const MAX_TITLE_SETS: usize = 2;
 const MAX_MENUS: usize = 2;
 /// Most `decode_intra` calls per sampling attempt, failed ones included.
 const MAX_DECODES_PER_GRAB: usize = 3;
-/// Most `decode_intra` calls for all title attempts of a disc.
-const TITLE_DECODES: usize = 16;
+/// Most `decode_intra` calls for all title attempts of a disc: enough for
+/// every attempt, so a main title whose pictures all fail still leaves the
+/// second title set its share.
+const TITLE_DECODES: usize = MAX_TITLE_ATTEMPTS * MAX_DECODES_PER_GRAB;
 /// Most `decode_intra` calls for all menu attempts of a disc.
 const MENU_DECODES: usize = MAX_MENUS * MAX_DECODES_PER_GRAB;
 /// Largest DVD-Video picture (PAL D1); anything larger is not decoded.
@@ -87,9 +110,11 @@ struct Vob<N> {
     size: u64,
 }
 
-/// One title set: its menu VOB (sized only when used) and the parts of its
-/// title VOBs in order.
+/// One title set (index 0: the video manager): its IFO file and backup, its
+/// menu VOB (sized only when used) and the parts of its title VOBs in order.
 struct TitleSet<N> {
+    ifo: Option<N>,
+    bup: Option<N>,
     menu: Option<(String, N)>,
     parts: Vec<(u8, Vob<N>)>,
     total: u64,
@@ -115,6 +140,31 @@ fn parse_vob_name(name: &str) -> Option<(u8, u8)> {
     (set >= 1).then_some((set, part))
 }
 
+/// Splits `VIDEO_TS.IFO` / `.BUP` into (0, backup) and `VTS_nn_0.IFO` / `.BUP`
+/// into (nn, backup).
+fn parse_ifo_name(name: &str) -> Option<(u8, bool)> {
+    let b = name.as_bytes();
+    if b.len() != 12 {
+        return None;
+    }
+    let backup = if b[8..].eq_ignore_ascii_case(b".IFO") {
+        false
+    } else if b[8..].eq_ignore_ascii_case(b".BUP") {
+        true
+    } else {
+        return None;
+    };
+    if b[..8].eq_ignore_ascii_case(b"VIDEO_TS") {
+        return Some((0, backup));
+    }
+    let digit = |c: u8| c.is_ascii_digit().then(|| c - b'0');
+    if !b[..4].eq_ignore_ascii_case(b"VTS_") || b[6] != b'_' || b[7] != b'0' {
+        return None;
+    }
+    let set = digit(b[4])? * 10 + digit(b[5])?;
+    (set >= 1).then_some((set, backup))
+}
+
 /// Whether the decoded frame is too damaged to show.
 fn too_damaged(frame: &Frame) -> bool {
     frame.total_macroblocks == 0
@@ -129,9 +179,9 @@ fn presentable(stats: &LumaStats) -> bool {
 }
 
 /// Whether the sequence header at the start of `es` (as returned by
-/// `find_intra_picture`) declares a picture no larger than DVD-Video allows.
-/// Larger ones are not DVD content and cost more to decode, so they are
-/// skipped before any allocation.
+/// `find_intra_picture`) declares a picture no larger than DVD-Video allows: a
+/// cheap first filter. The decoder enforces the same limit on the sequence
+/// header that actually applies to the I-picture (`decode_intra_within`).
 fn dvd_sized(es: &[u8]) -> bool {
     let Some(h) = es.get(..7) else {
         return false;
@@ -203,7 +253,7 @@ fn decode_next(es: &[u8], from: &mut usize, decodes: &mut Decodes) -> Option<Fra
         if !dvd_sized(picture) {
             continue;
         }
-        if let Ok(frame) = mpeg2::decode_intra(picture) {
+        if let Ok(frame) = mpeg2::decode_intra_within(picture, DVD_MAX_WIDTH, DVD_MAX_HEIGHT) {
             return Some(frame);
         }
     }
@@ -264,12 +314,13 @@ enum Grab {
 }
 
 /// Demultiplexes from byte `start` of `parts` until the first I-picture that
-/// decodes, scanning at most `MAX_SCAN_BYTES` and decoding at most
+/// decodes, scanning at most `limit` bytes and decoding at most
 /// `MAX_DECODES_PER_GRAB` pictures (and no more than `group` allows).
 fn grab_frame<F: FileSystem>(
     fs: &mut F,
     parts: &[&Vob<F::Node>],
     start: u64,
+    limit: u64,
     group: &mut usize,
 ) -> Grab {
     let mut decodes = Decodes {
@@ -282,16 +333,22 @@ fn grab_frame<F: FileSystem>(
     let mut pending: Vec<u8> = Vec::new();
     let mut es: Vec<u8> = Vec::new();
     let mut scanned = 0u64;
-    while scanned < MAX_SCAN_BYTES && !decodes.exhausted() {
-        let want = (MAX_SCAN_BYTES - scanned).min(READ_CHUNK as u64) as usize;
+    while scanned < limit && !decodes.exhausted() {
+        let want = (limit - scanned).min(READ_CHUNK as u64) as usize;
         let n = match cursor.read(fs, parts, &mut buf[..want]) {
             Ok(0) => {
                 // The end of the title: a picture that ends the stream counts
-                // as terminated (players show the last frame too).
-                es.extend_from_slice(&SEQUENCE_END);
-                let mut from = 0;
-                if let Some(frame) = decode_next(&es, &mut from, &mut decodes) {
-                    return Grab::Frame(frame);
+                // as terminated (players show the last frame too), but only
+                // when no packet was cut off and every macroblock decodes, so
+                // a truncated VOB does not give a frame with a grey band.
+                if pending.is_empty() {
+                    es.extend_from_slice(&SEQUENCE_END);
+                    let mut from = 0;
+                    if let Some(frame) = decode_next(&es, &mut from, &mut decodes) {
+                        if frame.concealed_macroblocks == 0 {
+                            return Grab::Frame(frame);
+                        }
+                    }
                 }
                 break;
             }
@@ -300,17 +357,35 @@ fn grab_frame<F: FileSystem>(
         };
         scanned += n as u64;
         pending.extend_from_slice(&buf[..n]);
-        let scrambled_before = demux.scrambled_packets;
-        let used = demux.push(&pending, &mut es).min(pending.len());
-        pending.drain(..used);
+        // Pack by pack, so that a skipped scrambled packet only costs the
+        // data around it.
+        let mut off = 0;
+        while off < pending.len() {
+            let end = (off + PACK as usize).min(pending.len());
+            let before = es.len();
+            let scrambled_before = demux.scrambled_packets;
+            let mut used = demux.push(&pending[off..end], &mut es);
+            if used == 0 {
+                // A unit longer than a pack (or cut off): give it all we have.
+                used = demux.push(&pending[off..], &mut es);
+                if used == 0 {
+                    break;
+                }
+            }
+            off += used;
+            if demux.scrambled_packets != scrambled_before {
+                // A dropped packet leaves a hole: pictures completed before it
+                // are still whole, the payload around it must not be spliced.
+                let mut from = 0;
+                if let Some(frame) = decode_next(&es[..before], &mut from, &mut decodes) {
+                    return Grab::Frame(frame);
+                }
+                es.clear();
+            }
+        }
+        pending.drain(..off.min(pending.len()));
         if demux.video_packets == 0 && demux.scrambled_packets >= SCRAMBLED_LIMIT {
             return Grab::Scrambled;
-        }
-        if demux.scrambled_packets != scrambled_before {
-            // A dropped packet leaves a hole: the clear payload around it
-            // must not be spliced into one picture.
-            es.clear();
-            continue;
         }
         let mut from = 0;
         if let Some(frame) = decode_next(&es, &mut from, &mut decodes) {
@@ -361,18 +436,16 @@ impl Candidate {
     }
 }
 
-/// Keeps the best frame seen so far and counts attempts.
+/// Keeps the best frame seen so far.
 #[derive(Default)]
 struct Selection {
     best: Option<Candidate>,
-    attempts: usize,
 }
 
 impl Selection {
-    /// Records one attempt. Returns true once a presentable frame was found
-    /// or `limit` attempts have been made.
-    fn offer(&mut self, candidate: Option<Candidate>, limit: usize) -> bool {
-        self.attempts += 1;
+    /// Records the outcome of one attempt. Returns true once a presentable
+    /// frame was found.
+    fn offer(&mut self, candidate: Option<Candidate>) -> bool {
         if let Some(c) = candidate {
             // Once the best is presentable the search stops, so a stored best
             // here is never presentable: a presentable newcomer always wins,
@@ -385,7 +458,7 @@ impl Selection {
                 self.best = Some(c);
             }
         }
-        self.found() || self.attempts >= limit
+        self.found()
     }
 
     fn found(&self) -> bool {
@@ -400,6 +473,7 @@ impl Selection {
 fn title_sets<F: FileSystem>(fs: &mut F, video_ts: &F::Node) -> Vec<TitleSet<F::Node>> {
     let mut seen = [[false; 10]; 100];
     let mut found = Vec::new();
+    let mut infos = Vec::new();
     let walked = fs.walk(video_ts, &mut |e| {
         if !e.is_dir {
             if let Some((set, part)) = parse_vob_name(&e.name) {
@@ -408,6 +482,8 @@ fn title_sets<F: FileSystem>(fs: &mut F, video_ts: &F::Node) -> Vec<TitleSet<F::
                     *slot = true;
                     found.push((set, part, e));
                 }
+            } else if let Some((set, backup)) = parse_ifo_name(&e.name) {
+                infos.push((set, backup, e.node));
             }
         }
         true
@@ -417,11 +493,20 @@ fn title_sets<F: FileSystem>(fs: &mut F, video_ts: &F::Node) -> Vec<TitleSet<F::
     }
     let mut sets: Vec<TitleSet<F::Node>> = (0..100)
         .map(|_| TitleSet {
+            ifo: None,
+            bup: None,
             menu: None,
             parts: Vec::new(),
             total: 0,
         })
         .collect();
+    for (set, backup, node) in infos {
+        let ts = &mut sets[set as usize];
+        let slot = if backup { &mut ts.bup } else { &mut ts.ifo };
+        if slot.is_none() {
+            *slot = Some(node);
+        }
+    }
     for (set, part, e) in found {
         let ts = &mut sets[set as usize];
         if part == 0 {
@@ -443,34 +528,124 @@ fn title_sets<F: FileSystem>(fs: &mut F, video_ts: &F::Node) -> Vec<TitleSet<F::
     sets
 }
 
-/// A frame of the disc's main title, or of its menus when the titles yield
-/// none. `None` when nothing decodable was found.
-pub fn title_frame<F: FileSystem>(fs: &mut F, video_ts: &F::Node) -> Option<Thumbnail> {
+/// Where the IFO (or its backup) of title set `ts` says `menu` starts.
+fn menu_cell<F: FileSystem>(
+    fs: &mut F,
+    ts: &TitleSet<F::Node>,
+    menu: Menu,
+) -> Option<ifo::MenuCell> {
+    ts.ifo
+        .iter()
+        .chain(ts.bup.iter())
+        .find_map(|node| ifo::menu_cell(fs, node, menu))
+}
+
+/// A picture of the disc's video: a menu the IFO files point at, a frame of
+/// the main title, or the first picture of a menu VOB, in that order (see the
+/// module documentation). `None` when nothing decodable was found.
+///
+/// `searched` is set when the disc's title VOB files could be found and
+/// sized, so that the caller does not repeat the search on another view of
+/// the same disc; a `VIDEO_TS` whose title VOBs cannot be read here leaves it
+/// unset.
+pub fn video_picture<F: FileSystem>(
+    fs: &mut F,
+    video_ts: &F::Node,
+    searched: &mut bool,
+) -> Option<Thumbnail> {
     let sets = title_sets(fs, video_ts);
+    if sets.is_empty() {
+        // VIDEO_TS could not be read.
+        return None;
+    }
+    // Title VOBs were found and sized: this view of the disc is readable.
+    if sets.iter().any(|ts| ts.total > 0) {
+        *searched = true;
+    }
     // Title sets with title VOBs, largest first (ties: lower number first).
     let mut order: Vec<usize> = (1..sets.len()).filter(|&i| sets[i].total > 0).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(sets[i].total));
     let mut selection = Selection::default();
-    let mut decodes = TITLE_DECODES;
-    'titles: for &i in order.iter().take(MAX_TITLE_SETS) {
-        let parts: Vec<&Vob<F::Node>> = sets[i].parts.iter().map(|(_, v)| v).collect();
-        let total = sets[i].total;
-        for permille in SAMPLE_PERMILLE {
-            let start = (u128::from(total) * u128::from(permille) / 1000) as u64;
-            let source = format!("VIDEO_TS/VTS_{i:02} title at {}%", permille / 10);
-            let candidate = match grab_frame(fs, &parts, start, &mut decodes) {
+
+    // 1. The root menu of the main title set, then the title menu.
+    let mut decodes = AUTHORED_MENU_DECODES;
+    let mut attempts = 0;
+    let authored = order
+        .first()
+        .map(|&i| (i, Menu::Root))
+        .into_iter()
+        .chain(std::iter::once((0, Menu::Title)));
+    'menus: for (i, menu) in authored {
+        let ts = &sets[i];
+        let Some((name, node)) = ts.menu.as_ref() else {
+            continue;
+        };
+        let Some(cell) = menu_cell(fs, ts, menu) else {
+            continue;
+        };
+        let size = fs.file_size(node).unwrap_or(0);
+        let vob = Vob {
+            node: node.clone(),
+            size,
+        };
+        let label = match menu {
+            Menu::Root => "root menu",
+            Menu::Title => "title menu",
+        };
+        let mut sectors = vec![cell.first_vobu];
+        if cell.last_vobu != cell.first_vobu {
+            sectors.push(cell.last_vobu);
+        }
+        for sector in sectors {
+            let start = u64::from(sector) * PACK;
+            if start >= size {
+                continue;
+            }
+            if attempts >= MAX_AUTHORED_MENU_ATTEMPTS {
+                break 'menus;
+            }
+            attempts += 1;
+            let source = format!("VIDEO_TS/{name} ({label})");
+            let candidate = match grab_frame(fs, &[&vob], start, MENU_SCAN_BYTES, &mut decodes) {
                 Grab::Frame(frame) => Candidate::new(frame, source),
-                // Every part of a scrambled title is scrambled.
-                Grab::Scrambled => continue 'titles,
-                Grab::Nothing => None,
+                Grab::Scrambled | Grab::Nothing => None,
             };
-            if selection.offer(candidate, MAX_TITLE_ATTEMPTS) {
-                break 'titles;
+            if selection.offer(candidate) {
+                break 'menus;
             }
         }
     }
-    if selection.best.is_none() {
-        // Menus: the video manager's first, then the title sets' in size order.
+
+    // 2. Frames of the main title (and of the next title set if needed).
+    if !selection.found() {
+        let mut decodes = TITLE_DECODES;
+        let mut attempts = 0;
+        'titles: for &i in order.iter().take(MAX_TITLE_SETS) {
+            let parts: Vec<&Vob<F::Node>> = sets[i].parts.iter().map(|(_, v)| v).collect();
+            let total = sets[i].total;
+            for permille in SAMPLE_PERMILLE {
+                if attempts >= MAX_TITLE_ATTEMPTS {
+                    break 'titles;
+                }
+                let start = (u128::from(total) * u128::from(permille) / 1000) as u64;
+                let source = format!("VIDEO_TS/VTS_{i:02} title at {}%", permille / 10);
+                let candidate = match grab_frame(fs, &parts, start, MAX_SCAN_BYTES, &mut decodes) {
+                    Grab::Frame(frame) => Candidate::new(frame, source),
+                    // Every part of a scrambled title is scrambled.
+                    Grab::Scrambled => continue 'titles,
+                    Grab::Nothing => None,
+                };
+                attempts += 1;
+                if selection.offer(candidate) {
+                    break 'titles;
+                }
+            }
+        }
+    }
+
+    // 3. Nothing presentable yet: the first picture of the menu VOBs, the
+    // video manager's first, then the title sets' in size order.
+    if !selection.found() {
         let mut decodes = MENU_DECODES;
         let mut attempts = 0;
         let menus = std::iter::once(0)
@@ -490,11 +665,11 @@ pub fn title_frame<F: FileSystem>(fs: &mut F, video_ts: &F::Node) -> Option<Thum
                 size,
             };
             let source = format!("VIDEO_TS/{name} (menu)");
-            let candidate = match grab_frame(fs, &[&vob], 0, &mut decodes) {
+            let candidate = match grab_frame(fs, &[&vob], 0, MAX_SCAN_BYTES, &mut decodes) {
                 Grab::Frame(frame) => Candidate::new(frame, source),
                 Grab::Scrambled | Grab::Nothing => None,
             };
-            if selection.offer(candidate, usize::MAX) {
+            if selection.offer(candidate) {
                 break;
             }
         }
@@ -537,7 +712,7 @@ fn decode_jacket(data: &[u8]) -> Option<Frame> {
     if !dvd_sized(picture) {
         return None;
     }
-    let frame = mpeg2::decode_intra(picture).ok()?;
+    let frame = mpeg2::decode_intra_within(picture, DVD_MAX_WIDTH, DVD_MAX_HEIGHT).ok()?;
     (!too_damaged(&frame)).then_some(frame)
 }
 
@@ -595,6 +770,19 @@ mod tests {
         assert_eq!(parse_vob_name("VTS_01_10.VOB"), None);
         assert_eq!(parse_vob_name("VTS_01_1.VOBX"), None);
         assert_eq!(parse_vob_name("é_01_1.VOB"), None);
+    }
+
+    #[test]
+    fn ifo_names() {
+        assert_eq!(parse_ifo_name("VIDEO_TS.IFO"), Some((0, false)));
+        assert_eq!(parse_ifo_name("video_ts.bup"), Some((0, true)));
+        assert_eq!(parse_ifo_name("VTS_01_0.IFO"), Some((1, false)));
+        assert_eq!(parse_ifo_name("VTS_42_0.BUP"), Some((42, true)));
+        assert_eq!(parse_ifo_name("VTS_01_1.IFO"), None);
+        assert_eq!(parse_ifo_name("VTS_00_0.IFO"), None);
+        assert_eq!(parse_ifo_name("VTS_01_0.VOB"), None);
+        assert_eq!(parse_ifo_name("VIDEO_TS.VOB"), None);
+        assert_eq!(parse_ifo_name("VTS_1A_0.IFO"), None);
     }
 
     #[test]

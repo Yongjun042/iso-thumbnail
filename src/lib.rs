@@ -11,6 +11,7 @@ pub mod error;
 pub mod extract;
 pub mod finder;
 pub mod fs;
+pub mod ifo;
 pub mod iso9660;
 pub mod mpeg2;
 pub mod mpegps;

@@ -131,15 +131,17 @@ pub fn active_area(frame: &Frame) -> Rect {
 /// The cuts to make for a pair of opposite borders `a` and `b` lines thick,
 /// each found by a scan limited to `cap` lines.
 ///
-/// A border that reaches the cap is dark picture content, not a bar: no cut on
-/// either side (a 16:9 film letterboxed in 4:3 has bars of an eighth, even
-/// 2.4:1 stays below a quarter). Bars of clearly different thickness (more
-/// than `tolerance` lines apart) are trimmed to the thinner one, so dark
-/// content next to one bar, or a one-sided dark edge, is kept.
+/// Borders that both reach the cap are dark picture content (black around a
+/// logo or a title), not bars: no cut (a 16:9 film letterboxed in 4:3 has bars
+/// of an eighth, even 2.4:1 stays below a quarter). Bars of clearly different
+/// thickness (more than `tolerance` lines apart, or one reaching the cap) are
+/// trimmed to the thinner one, so dark content next to one bar (a night sky
+/// under the top bar) is kept, and a one-sided dark edge, whose other side
+/// is 0, is not cut at all.
 fn bar_pair(a: u32, b: u32, cap: u32, tolerance: u32) -> (u32, u32) {
-    if a >= cap || b >= cap {
+    if a >= cap && b >= cap {
         (0, 0)
-    } else if a.abs_diff(b) > tolerance {
+    } else if a >= cap || b >= cap || a.abs_diff(b) > tolerance {
         let thinner = a.min(b);
         (thinner, thinner)
     } else {
@@ -726,17 +728,34 @@ mod tests {
         bar(&mut f, 0, 170, 0, 480);
         assert_eq!(active_area(&f), full, "dark left side only");
         // A letterboxed frame whose top bar continues into a dark sky: only
-        // the bar thickness of the bottom side is cut at the top.
+        // the bar thickness of the bottom side is cut at the top (also when
+        // the sky reaches the quarter limit).
+        for sky in [100, 140] {
+            let mut f = textured(720, 480);
+            bar(&mut f, 0, 720, 0, sky);
+            bar(&mut f, 0, 720, 420, 480);
+            assert_eq!(
+                active_area(&f),
+                Rect {
+                    x: 0,
+                    y: 60,
+                    width: 720,
+                    height: 360
+                },
+                "sky {sky}"
+            );
+        }
+        // A 4:3 pillarbox in a 16:9 frame next to a dark wall.
         let mut f = textured(720, 480);
-        bar(&mut f, 0, 720, 0, 100);
-        bar(&mut f, 0, 720, 420, 480);
+        bar(&mut f, 0, 200, 0, 480);
+        bar(&mut f, 630, 720, 0, 480);
         assert_eq!(
             active_area(&f),
             Rect {
-                x: 0,
-                y: 60,
-                width: 720,
-                height: 360
+                x: 90,
+                y: 0,
+                width: 540,
+                height: 480
             }
         );
     }

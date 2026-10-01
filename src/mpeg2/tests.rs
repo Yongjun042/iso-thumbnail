@@ -356,6 +356,9 @@ fn pixel_aspect_ratios() {
     // A display rectangle that keeps the whole picture 4:3 is used.
     assert_eq!(pixel_aspect(true, 2, (720, 480), Some((720, 480))), (8, 9));
     assert_eq!(pixel_aspect(true, 2, (720, 480), Some((360, 240))), (8, 9));
+    // Any u32 input is safe (no overflow panic in the public helper).
+    let _ = pixel_aspect(true, 4, (u32::MAX, u32::MAX), Some((u32::MAX, u32::MAX)));
+    let _ = pixel_aspect(true, 3, (u32::MAX, 1), Some((1, u32::MAX)));
     // A zero display size falls back to the picture size.
     assert_eq!(pixel_aspect(true, 2, (720, 480), Some((0, 480))), (8, 9));
     for code in [0, 5, 9, 15] {

@@ -129,6 +129,16 @@ pub fn find_intra_picture(es: &[u8]) -> Option<Range<usize>> {
 /// headers are unusable, the format is unsupported, the size exceeds
 /// `MAX_WIDTH` × `MAX_HEIGHT`, or no macroblock at all could be decoded.
 pub fn decode_intra(es: &[u8]) -> Result<Frame> {
+    decode_intra_within(es, MAX_WIDTH, MAX_HEIGHT)
+}
+
+/// Like `decode_intra`, but fails with `TooLarge` before allocating anything
+/// when the sequence header that applies to the I-picture declares a picture
+/// wider than `max_width` or taller than `max_height` (both capped at
+/// `MAX_WIDTH` × `MAX_HEIGHT`). Callers that know their content, such as DVD
+/// (720 × 576 at most), use it to keep foreign pictures from costing more.
+pub fn decode_intra_within(es: &[u8], max_width: u32, max_height: u32) -> Result<Frame> {
+    let limit = (max_width.min(MAX_WIDTH), max_height.min(MAX_HEIGHT));
     let start = first_sequence_header(es).ok_or(Error::Corrupt("no MPEG sequence header"))?;
     let mut units = Units::new(es, start);
     let first = units
@@ -148,7 +158,7 @@ pub fn decode_intra(es: &[u8]) -> Result<Frame> {
                 continue;
             };
             if picture.is_none() {
-                picture = Some(start_picture(&seq, coding)?);
+                picture = Some(start_picture(&seq, coding, limit)?);
             }
             if let Some((decoder, _)) = picture.as_mut() {
                 decoder.decode_slice(unit.code, data);
@@ -262,6 +272,7 @@ fn payload<'a>(es: &'a [u8], unit: &Unit) -> &'a [u8] {
 fn start_picture(
     seq: &Sequence,
     coding: Option<PictureCoding>,
+    limit: (u32, u32),
 ) -> Result<(PictureDecoder, Layout)> {
     let coding = if seq.mpeg2 {
         coding.ok_or(Error::Corrupt("MPEG-2 picture without coding extension"))?
@@ -274,7 +285,7 @@ fn start_picture(
     if seq.width == 0 || seq.height == 0 {
         return Err(Error::Corrupt("MPEG picture size is zero"));
     }
-    if seq.width > MAX_WIDTH || seq.height > MAX_HEIGHT {
+    if seq.width > limit.0 || seq.height > limit.1 {
         return Err(Error::TooLarge);
     }
     if coding.picture_structure == 0 {

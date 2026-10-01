@@ -5,7 +5,8 @@
 //! 2. `BDMV/META/TN/*.jpg` – Blu-ray track-name thumbnails.
 //! 3. `JACKET_P/J00___5L.MP2` – the DVD-Video jacket picture (see `crate::dvd`).
 //! 4. `cover.jpg`, `folder.jpg`, … in the root directory of any data disc.
-//! 5. A frame of the DVD-Video main title (`VIDEO_TS`), or of its menus.
+//! 5. A picture of the DVD-Video's video (`VIDEO_TS`): its root or title menu,
+//!    else a frame of the main title (see `crate::dvd`).
 
 use crate::dvd;
 use crate::error::{Error, Result};
@@ -152,10 +153,12 @@ fn best_image_in<F: FileSystem>(
 /// Finds the thumbnail of the file system's disc, in the order described in
 /// the module documentation.
 ///
-/// `dvd_searched` says whether the DVD steps (jacket picture, title frame)
-/// already ran on another view of the same disc: a DVD carries the same
-/// files on its UDF and ISO 9660 sides, and the frame search is the costly
-/// part, so it runs at most once. It is set when this call runs them.
+/// `dvd_searched` says whether the DVD steps (jacket picture, menus and
+/// frames) already ran on another view of the same disc: a DVD carries the
+/// same files on its UDF and ISO 9660 sides, and the video search is the
+/// costly part, so it runs at most once. It is set when this call could read
+/// the DVD's title VOBs; a view whose DVD files are unreadable leaves it
+/// unset, so the other view still gets its turn.
 pub fn find_thumbnail<F: FileSystem>(fs: &mut F, dvd_searched: &mut bool) -> Result<Thumbnail> {
     let root = fs.root()?;
     // One pass over the root collects the disc folders and the cover
@@ -197,10 +200,7 @@ pub fn find_thumbnail<F: FileSystem>(fs: &mut F, dvd_searched: &mut bool) -> Res
             }
         }
     }
-    let search_dvd = !*dvd_searched && (jacket_p.is_some() || video_ts.is_some());
-    if search_dvd {
-        *dvd_searched = true;
-    }
+    let search_dvd = !*dvd_searched;
     if let Some(dir) = jacket_p.as_ref().filter(|_| search_dvd) {
         if let Some(t) = dvd::jacket_picture(fs, dir) {
             return Ok(t);
@@ -216,9 +216,9 @@ pub fn find_thumbnail<F: FileSystem>(fs: &mut F, dvd_searched: &mut bool) -> Res
     if let Some(t) = first_readable(fs, candidates) {
         return Ok(t);
     }
-    // Last: a frame of the DVD's video, which costs the most reads.
+    // Last: the DVD's menus or a frame of its video, which costs the most.
     if let Some(dir) = video_ts.as_ref().filter(|_| search_dvd) {
-        if let Some(t) = dvd::title_frame(fs, dir) {
+        if let Some(t) = dvd::video_picture(fs, dir, dvd_searched) {
             return Ok(t);
         }
     }
