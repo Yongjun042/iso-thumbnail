@@ -86,9 +86,12 @@ const BORDER_MAX_VARIANCE: u64 = 36;
 ///
 /// A line is a border when its sampled luma has a mean of at most 26 and a
 /// standard deviation of at most 6. Each side is scanned inward and stops at
-/// the first line that is not a border. A frame whose remaining middle is just
-/// as dark (a black or nearly black frame) is returned whole: there is nothing
-/// to frame in it.
+/// the first line that is not a border. Real bars come in pairs of about the
+/// same thickness that stay below a quarter of the frame, while dark picture
+/// content at an edge (a night sky, a dark wall, black around a logo) does
+/// not: see `bar_pair`. A frame whose remaining middle is just as dark (a
+/// black or nearly black frame) is returned whole: there is nothing to frame
+/// in it.
 pub fn active_area(frame: &Frame) -> Rect {
     let full = full_area(frame);
     if !luma_ok(frame) || frame.width < 4 || frame.height < 4 {
@@ -98,6 +101,7 @@ pub fn active_area(frame: &Frame) -> Rect {
     let row = |y: u32| line_is_border(frame, 0, y, 1, 0, w);
     let top = (0..h / 4).take_while(|&y| row(y)).count() as u32;
     let bottom = (0..h / 4).take_while(|&i| row(h - 1 - i)).count() as u32;
+    let (top, bottom) = bar_pair(top, bottom, h / 4, (h / 60).max(4));
     // Columns are judged on the rows that remain, so letterbox bars do not
     // make every column look dark.
     let (y0, y1) = (top, h - bottom);
@@ -105,6 +109,7 @@ pub fn active_area(frame: &Frame) -> Rect {
     let col = |x: u32| line_is_border(frame, x, y0, 0, 1, rows);
     let left = (0..w / 4).take_while(|&x| col(x)).count() as u32;
     let right = (0..w / 4).take_while(|&i| col(w - 1 - i)).count() as u32;
+    let (left, right) = bar_pair(left, right, w / 4, (w / 60).max(4));
     if top + bottom + left + right == 0 {
         return full;
     }
@@ -121,6 +126,25 @@ pub fn active_area(frame: &Frame) -> Rect {
         return full;
     }
     area
+}
+
+/// The cuts to make for a pair of opposite borders `a` and `b` lines thick,
+/// each found by a scan limited to `cap` lines.
+///
+/// A border that reaches the cap is dark picture content, not a bar: no cut on
+/// either side (a 16:9 film letterboxed in 4:3 has bars of an eighth, even
+/// 2.4:1 stays below a quarter). Bars of clearly different thickness (more
+/// than `tolerance` lines apart) are trimmed to the thinner one, so dark
+/// content next to one bar, or a one-sided dark edge, is kept.
+fn bar_pair(a: u32, b: u32, cap: u32, tolerance: u32) -> (u32, u32) {
+    if a >= cap || b >= cap {
+        (0, 0)
+    } else if a.abs_diff(b) > tolerance {
+        let thinner = a.min(b);
+        (thinner, thinner)
+    } else {
+        (a, b)
+    }
 }
 
 /// End of the kept range when `cut` lines are cut from the far side of a
@@ -658,17 +682,61 @@ mod tests {
             }
         );
 
-        // Bars thicker than a quarter are only cut up to the quarter.
+        // Dark borders reaching a quarter are picture content (black around
+        // a logo or a title), not bars.
         let mut f = textured(720, 480);
         bar(&mut f, 0, 720, 0, 150);
         bar(&mut f, 0, 720, 330, 480);
+        assert_eq!(active_area(&f), full);
+        let mut f = textured(720, 480);
+        bar(&mut f, 0, 720, 0, 120);
+        bar(&mut f, 0, 720, 360, 480);
+        bar(&mut f, 0, 180, 0, 480);
+        bar(&mut f, 540, 720, 0, 480);
+        assert_eq!(active_area(&f), full, "bright box centred on black");
+
+        // Bars of different thickness are trimmed to the thinner one.
+        let mut f = textured(720, 480);
+        bar(&mut f, 0, 720, 0, 60);
+        bar(&mut f, 0, 720, 450, 480);
         assert_eq!(
             active_area(&f),
             Rect {
                 x: 0,
-                y: 120,
+                y: 30,
                 width: 720,
-                height: 240
+                height: 420
+            }
+        );
+    }
+
+    #[test]
+    fn one_sided_dark_edges_are_picture_content() {
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: 720,
+            height: 480,
+        };
+        // A dark sky above the scene, a dark wall at one side.
+        let mut f = textured(720, 480);
+        bar(&mut f, 0, 720, 0, 100);
+        assert_eq!(active_area(&f), full, "dark top only");
+        let mut f = textured(720, 480);
+        bar(&mut f, 0, 170, 0, 480);
+        assert_eq!(active_area(&f), full, "dark left side only");
+        // A letterboxed frame whose top bar continues into a dark sky: only
+        // the bar thickness of the bottom side is cut at the top.
+        let mut f = textured(720, 480);
+        bar(&mut f, 0, 720, 0, 100);
+        bar(&mut f, 0, 720, 420, 480);
+        assert_eq!(
+            active_area(&f),
+            Rect {
+                x: 0,
+                y: 60,
+                width: 720,
+                height: 360
             }
         );
     }

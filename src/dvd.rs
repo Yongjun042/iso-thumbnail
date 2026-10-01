@@ -12,11 +12,15 @@
 //!    (`VIDEO_TS.VOB`, `VTS_nn_0.VOB`) are the last resort.
 //!
 //! Scrambled (CSS) video packets are skipped, never decrypted: a title whose
-//! video is scrambled yields no frame.
+//! video is scrambled yields no frame (its menus may still be unscrambled).
 //!
-//! Work is bounded: every read goes through the image's `CachedReader`
-//! budgets, each sampling attempt scans at most `MAX_SCAN_BYTES`, and at most
-//! `MAX_ATTEMPTS` frames are decoded.
+//! Work is bounded on every axis, also for crafted images: all reads go
+//! through the image's `CachedReader` budgets; each sampling attempt scans at
+//! most `MAX_SCAN_BYTES`; there are at most `MAX_TITLE_ATTEMPTS` title and
+//! `MAX_MENUS` menu attempts; and every `decode_intra` call counts against
+//! `MAX_DECODES_PER_GRAB` and the per-disc `TITLE_DECODES` / `MENU_DECODES`,
+//! failed ones included. Pictures larger than DVD-Video allows are not
+//! decoded at all.
 
 use crate::finder::{Content, Thumbnail};
 use crate::fs::FileSystem;
@@ -41,16 +45,27 @@ const MAX_ES_BYTES: usize = 2 << 20;
 /// comes last: a title shorter than a few VOBUs has its only sequence
 /// headers there.
 const SAMPLE_PERMILLE: [u64; 6] = [250, 400, 150, 550, 700, 0];
-/// Most sampling attempts per disc (titles and menus together).
-const MAX_ATTEMPTS: usize = 8;
+/// Most sampling attempts in titles: all of the main title's positions and
+/// two of the next title set's.
+const MAX_TITLE_ATTEMPTS: usize = 8;
 /// Title sets tried, largest first, when the largest yields nothing.
 const MAX_TITLE_SETS: usize = 2;
-/// Menu VOBs tried when no title frame was found.
+/// Menu VOBs tried when no title frame was found. They have their own
+/// attempts and decodes, so titles that fail cannot starve them.
 const MAX_MENUS: usize = 2;
-/// Most VOB files considered in `VIDEO_TS` (a real disc has a few dozen).
-const MAX_VOB_FILES: usize = 64;
+/// Most `decode_intra` calls per sampling attempt, failed ones included.
+const MAX_DECODES_PER_GRAB: usize = 3;
+/// Most `decode_intra` calls for all title attempts of a disc.
+const TITLE_DECODES: usize = 16;
+/// Most `decode_intra` calls for all menu attempts of a disc.
+const MENU_DECODES: usize = MAX_MENUS * MAX_DECODES_PER_GRAB;
+/// Largest DVD-Video picture (PAL D1); anything larger is not decoded.
+const DVD_MAX_WIDTH: u32 = 720;
+const DVD_MAX_HEIGHT: u32 = 576;
 /// Largest jacket picture file accepted (a 720x576 MPEG-2 still is far smaller).
 const MAX_JACKET_BYTES: usize = 2 << 20;
+/// Most bytes read from all jacket picture files together.
+const MAX_JACKET_TOTAL: u64 = 4 << 20;
 /// Jacket picture files considered in `JACKET_P`.
 const MAX_JACKET_FILES: usize = 16;
 /// Scrambled video packets seen without any clear one before a title is
@@ -66,16 +81,16 @@ const MIN_STDDEV: f32 = 10.0;
 const SEQUENCE_HEADER: [u8; 4] = [0, 0, 1, 0xB3];
 const SEQUENCE_END: [u8; 4] = [0, 0, 1, 0xB7];
 
-/// A VOB file of the disc.
+/// A title VOB part of the disc.
 struct Vob<N> {
-    name: String,
     node: N,
     size: u64,
 }
 
-/// One title set: its menu VOB and the parts of its title VOBs in order.
+/// One title set: its menu VOB (sized only when used) and the parts of its
+/// title VOBs in order.
 struct TitleSet<N> {
-    menu: Option<Vob<N>>,
+    menu: Option<(String, N)>,
     parts: Vec<(u8, Vob<N>)>,
     total: u64,
 }
@@ -113,6 +128,23 @@ fn presentable(stats: &LumaStats) -> bool {
     stats.mean >= MIN_MEAN && stats.mean <= MAX_MEAN && stats.stddev >= MIN_STDDEV
 }
 
+/// Whether the sequence header at the start of `es` (as returned by
+/// `find_intra_picture`) declares a picture no larger than DVD-Video allows.
+/// Larger ones are not DVD content and cost more to decode, so they are
+/// skipped before any allocation.
+fn dvd_sized(es: &[u8]) -> bool {
+    let Some(h) = es.get(..7) else {
+        return false;
+    };
+    if h[..4] != SEQUENCE_HEADER {
+        return false;
+    }
+    let (a, b, c) = (h[4], h[5], h[6]);
+    let width = (u32::from(a) << 4) | u32::from(b >> 4);
+    let height = (u32::from(b & 0x0F) << 8) | u32::from(c);
+    width <= DVD_MAX_WIDTH && height <= DVD_MAX_HEIGHT
+}
+
 /// Last index of `needle` in `hay`.
 fn rfind(hay: &[u8], needle: &[u8; 4]) -> Option<usize> {
     hay.windows(4).rposition(|w| w == needle)
@@ -132,6 +164,50 @@ fn trim_es(es: &mut Vec<u8>) {
             es.drain(..es.len() - keep);
         }
     }
+}
+
+/// `decode_intra` calls still allowed: per sampling attempt and for a whole
+/// group of attempts (the titles or the menus of a disc).
+struct Decodes<'a> {
+    grab: usize,
+    group: &'a mut usize,
+}
+
+impl Decodes<'_> {
+    fn take(&mut self) -> bool {
+        if self.grab == 0 || *self.group == 0 {
+            return false;
+        }
+        self.grab -= 1;
+        *self.group -= 1;
+        true
+    }
+
+    fn exhausted(&self) -> bool {
+        self.grab == 0 || *self.group == 0
+    }
+}
+
+/// Decodes the complete I-pictures of `es` from byte `*from` on, within the
+/// decode allowance. `*from` moves past every picture tried, so a failed one
+/// is never tried again and nothing is copied.
+fn decode_next(es: &[u8], from: &mut usize, decodes: &mut Decodes) -> Option<Frame> {
+    while !decodes.exhausted() {
+        let range = mpeg2::find_intra_picture(es.get(*from..)?)?;
+        let (start, end) = (*from + range.start, *from + range.end);
+        *from = end;
+        let picture = &es[start..end];
+        // Even skipped pictures count: a stream of many tiny pictures must not
+        // turn one attempt into thousands of header parses.
+        decodes.take();
+        if !dvd_sized(picture) {
+            continue;
+        }
+        if let Ok(frame) = mpeg2::decode_intra(picture) {
+            return Some(frame);
+        }
+    }
+    None
 }
 
 /// Reads the concatenated parts of a title (or a single VOB) in sequence.
@@ -182,41 +258,65 @@ enum Grab {
     Frame(Frame),
     /// The video packets are scrambled (CSS).
     Scrambled,
-    /// No complete, decodable I-picture within the scan limit, or a read
-    /// failed (for instance because the image's read budget is used up).
+    /// No complete, decodable I-picture within the scan and decode limits, or
+    /// a read failed (for instance because the image's read budget is used up).
     Nothing,
 }
 
 /// Demultiplexes from byte `start` of `parts` until the first I-picture that
-/// decodes, scanning at most `MAX_SCAN_BYTES`.
-fn grab_frame<F: FileSystem>(fs: &mut F, parts: &[&Vob<F::Node>], start: u64) -> Grab {
+/// decodes, scanning at most `MAX_SCAN_BYTES` and decoding at most
+/// `MAX_DECODES_PER_GRAB` pictures (and no more than `group` allows).
+fn grab_frame<F: FileSystem>(
+    fs: &mut F,
+    parts: &[&Vob<F::Node>],
+    start: u64,
+    group: &mut usize,
+) -> Grab {
+    let mut decodes = Decodes {
+        grab: MAX_DECODES_PER_GRAB,
+        group,
+    };
     let mut cursor = Cursor::at(parts, start - start % PACK);
     let mut demux = Demuxer::new();
     let mut buf = vec![0u8; READ_CHUNK];
     let mut pending: Vec<u8> = Vec::new();
     let mut es: Vec<u8> = Vec::new();
     let mut scanned = 0u64;
-    while scanned < MAX_SCAN_BYTES {
+    while scanned < MAX_SCAN_BYTES && !decodes.exhausted() {
         let want = (MAX_SCAN_BYTES - scanned).min(READ_CHUNK as u64) as usize;
         let n = match cursor.read(fs, parts, &mut buf[..want]) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                // The end of the title: a picture that ends the stream counts
+                // as terminated (players show the last frame too).
+                es.extend_from_slice(&SEQUENCE_END);
+                let mut from = 0;
+                if let Some(frame) = decode_next(&es, &mut from, &mut decodes) {
+                    return Grab::Frame(frame);
+                }
+                break;
+            }
+            Err(_) => break,
             Ok(n) => n,
         };
         scanned += n as u64;
         pending.extend_from_slice(&buf[..n]);
+        let scrambled_before = demux.scrambled_packets;
         let used = demux.push(&pending, &mut es).min(pending.len());
         pending.drain(..used);
         if demux.video_packets == 0 && demux.scrambled_packets >= SCRAMBLED_LIMIT {
             return Grab::Scrambled;
         }
-        while let Some(range) = mpeg2::find_intra_picture(&es) {
-            let end = range.end;
-            if let Ok(frame) = mpeg2::decode_intra(&es[range]) {
-                return Grab::Frame(frame);
-            }
-            // Undecodable picture: look for the next one after it.
-            es.drain(..end.min(es.len()));
+        if demux.scrambled_packets != scrambled_before {
+            // A dropped packet leaves a hole: the clear payload around it
+            // must not be spliced into one picture.
+            es.clear();
+            continue;
         }
+        let mut from = 0;
+        if let Some(frame) = decode_next(&es, &mut from, &mut decodes) {
+            return Grab::Frame(frame);
+        }
+        es.drain(..from.min(es.len()));
         trim_es(&mut es);
         if es.len() > MAX_ES_BYTES {
             break;
@@ -252,15 +352,16 @@ impl Candidate {
         })
     }
 
-    fn into_thumbnail(self) -> Thumbnail {
-        Thumbnail {
+    fn into_thumbnail(self) -> Option<Thumbnail> {
+        let picture = picture::to_picture(&self.frame, self.area);
+        (picture.width > 0 && picture.height > 0).then_some(Thumbnail {
             path: self.source,
-            content: Content::Picture(picture::to_picture(&self.frame, self.area)),
-        }
+            content: Content::Picture(picture),
+        })
     }
 }
 
-/// Keeps the best frame seen so far and says when to stop looking.
+/// Keeps the best frame seen so far and counts attempts.
 #[derive(Default)]
 struct Selection {
     best: Option<Candidate>,
@@ -268,13 +369,14 @@ struct Selection {
 }
 
 impl Selection {
-    /// Returns true once a presentable frame was found or attempts ran out.
-    fn offer(&mut self, candidate: Option<Candidate>) -> bool {
+    /// Records one attempt. Returns true once a presentable frame was found
+    /// or `limit` attempts have been made.
+    fn offer(&mut self, candidate: Option<Candidate>, limit: usize) -> bool {
         self.attempts += 1;
         if let Some(c) = candidate {
-            // Once the best is presentable `done` stops the search, so a
-            // stored best here is never presentable: a presentable newcomer
-            // always wins, otherwise the one with more detail.
+            // Once the best is presentable the search stops, so a stored best
+            // here is never presentable: a presentable newcomer always wins,
+            // otherwise the one with more detail.
             let better = match &self.best {
                 None => true,
                 Some(b) => presentable(&c.stats) || c.stats.stddev > b.stats.stddev,
@@ -283,25 +385,32 @@ impl Selection {
                 self.best = Some(c);
             }
         }
-        self.done()
+        self.found() || self.attempts >= limit
     }
 
-    fn done(&self) -> bool {
-        self.best.as_ref().is_some_and(|b| presentable(&b.stats)) || self.attempts >= MAX_ATTEMPTS
+    fn found(&self) -> bool {
+        self.best.as_ref().is_some_and(|b| presentable(&b.stats))
     }
 }
 
 /// Collects the VOB files of `VIDEO_TS` grouped by title set (index 0 holds
-/// `VIDEO_TS.VOB`, the video manager menu).
+/// `VIDEO_TS.VOB`, the video manager menu). Duplicate names count once, so
+/// the walk (bounded by the directory limits) sees every title set a disc can
+/// have; only title parts are sized here.
 fn title_sets<F: FileSystem>(fs: &mut F, video_ts: &F::Node) -> Vec<TitleSet<F::Node>> {
+    let mut seen = [[false; 10]; 100];
     let mut found = Vec::new();
     let walked = fs.walk(video_ts, &mut |e| {
         if !e.is_dir {
             if let Some((set, part)) = parse_vob_name(&e.name) {
-                found.push((set, part, e));
+                let slot = &mut seen[set as usize][part as usize];
+                if !*slot {
+                    *slot = true;
+                    found.push((set, part, e));
+                }
             }
         }
-        found.len() < MAX_VOB_FILES
+        true
     });
     if walked.is_err() {
         return Vec::new();
@@ -314,26 +423,18 @@ fn title_sets<F: FileSystem>(fs: &mut F, video_ts: &F::Node) -> Vec<TitleSet<F::
         })
         .collect();
     for (set, part, e) in found {
+        let ts = &mut sets[set as usize];
+        if part == 0 {
+            ts.menu = Some((e.name, e.node));
+            continue;
+        }
         // A size that cannot be read leaves the file out.
         let Ok(size) = fs.file_size(&e.node) else {
             continue;
         };
-        if size == 0 {
-            continue;
-        }
-        let vob = Vob {
-            name: e.name,
-            node: e.node,
-            size,
-        };
-        let ts = &mut sets[set as usize];
-        if part == 0 {
-            if ts.menu.is_none() {
-                ts.menu = Some(vob);
-            }
-        } else if !ts.parts.iter().any(|(p, _)| *p == part) {
+        if size > 0 {
             ts.total = ts.total.saturating_add(size);
-            ts.parts.push((part, vob));
+            ts.parts.push((part, Vob { node: e.node, size }));
         }
     }
     for ts in &mut sets {
@@ -350,49 +451,55 @@ pub fn title_frame<F: FileSystem>(fs: &mut F, video_ts: &F::Node) -> Option<Thum
     let mut order: Vec<usize> = (1..sets.len()).filter(|&i| sets[i].total > 0).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(sets[i].total));
     let mut selection = Selection::default();
+    let mut decodes = TITLE_DECODES;
     'titles: for &i in order.iter().take(MAX_TITLE_SETS) {
         let parts: Vec<&Vob<F::Node>> = sets[i].parts.iter().map(|(_, v)| v).collect();
         let total = sets[i].total;
         for permille in SAMPLE_PERMILLE {
             let start = (u128::from(total) * u128::from(permille) / 1000) as u64;
             let source = format!("VIDEO_TS/VTS_{i:02} title at {}%", permille / 10);
-            match grab_frame(fs, &parts, start) {
-                Grab::Frame(frame) => {
-                    if selection.offer(Candidate::new(frame, source)) {
-                        break 'titles;
-                    }
-                }
+            let candidate = match grab_frame(fs, &parts, start, &mut decodes) {
+                Grab::Frame(frame) => Candidate::new(frame, source),
                 // Every part of a scrambled title is scrambled.
                 Grab::Scrambled => continue 'titles,
-                Grab::Nothing => {
-                    if selection.offer(None) {
-                        break 'titles;
-                    }
-                }
+                Grab::Nothing => None,
+            };
+            if selection.offer(candidate, MAX_TITLE_ATTEMPTS) {
+                break 'titles;
             }
         }
     }
     if selection.best.is_none() {
         // Menus: the video manager's first, then the title sets' in size order.
+        let mut decodes = MENU_DECODES;
+        let mut attempts = 0;
         let menus = std::iter::once(0)
             .chain(order.iter().copied())
-            .filter_map(|i| sets[i].menu.as_ref())
-            .take(MAX_MENUS);
-        for menu in menus {
-            if selection.attempts >= MAX_ATTEMPTS {
+            .filter_map(|i| sets[i].menu.as_ref());
+        for (name, node) in menus {
+            if attempts >= MAX_MENUS {
                 break;
             }
-            let source = format!("VIDEO_TS/{} (menu)", menu.name);
-            let candidate = match grab_frame(fs, &[menu], 0) {
+            let size = fs.file_size(node).unwrap_or(0);
+            if size == 0 {
+                continue;
+            }
+            attempts += 1;
+            let vob = Vob {
+                node: node.clone(),
+                size,
+            };
+            let source = format!("VIDEO_TS/{name} (menu)");
+            let candidate = match grab_frame(fs, &[&vob], 0, &mut decodes) {
                 Grab::Frame(frame) => Candidate::new(frame, source),
                 Grab::Scrambled | Grab::Nothing => None,
             };
-            if selection.offer(candidate) {
+            if selection.offer(candidate, usize::MAX) {
                 break;
             }
         }
     }
-    selection.best.map(Candidate::into_thumbnail)
+    selection.best.and_then(Candidate::into_thumbnail)
 }
 
 /// Rank of a jacket picture file name: `J00___5L.MP2` (large) first, then
@@ -426,7 +533,11 @@ fn decode_jacket(data: &[u8]) -> Option<Frame> {
     // The file ends with the picture: make sure it counts as terminated.
     es.extend_from_slice(&SEQUENCE_END);
     let range = mpeg2::find_intra_picture(&es)?;
-    let frame = mpeg2::decode_intra(&es[range]).ok()?;
+    let picture = &es[range];
+    if !dvd_sized(picture) {
+        return None;
+    }
+    let frame = mpeg2::decode_intra(picture).ok()?;
     (!too_damaged(&frame)).then_some(frame)
 }
 
@@ -443,20 +554,24 @@ pub fn jacket_picture<F: FileSystem>(fs: &mut F, jacket_p: &F::Node) -> Option<T
     })
     .ok()?;
     files.sort_by_key(|(rank, _)| *rank);
+    let mut read = 0u64;
     for (_, e) in files {
         let size = fs.file_size(&e.node).unwrap_or(0);
-        if size == 0 || size > MAX_JACKET_BYTES as u64 {
+        if size == 0 || size > MAX_JACKET_BYTES as u64 || read + size > MAX_JACKET_TOTAL {
             continue;
         }
+        read += size;
         let Ok(data) = fs.read(&e.node, MAX_JACKET_BYTES) else {
             continue;
         };
         if let Some(frame) = decode_jacket(&data) {
-            let area = picture::full_area(&frame);
-            return Some(Thumbnail {
-                path: format!("JACKET_P/{}", e.name),
-                content: Content::Picture(picture::to_picture(&frame, area)),
-            });
+            let picture = picture::to_picture(&frame, picture::full_area(&frame));
+            if picture.width > 0 && picture.height > 0 {
+                return Some(Thumbnail {
+                    path: format!("JACKET_P/{}", e.name),
+                    content: Content::Picture(picture),
+                });
+            }
         }
     }
     None
@@ -504,6 +619,49 @@ mod tests {
         let mut es = vec![0, 0, 1, 0xB3];
         trim_es(&mut es);
         assert_eq!(es, vec![0, 0, 1, 0xB3]);
+    }
+
+    #[test]
+    fn dvd_sizes() {
+        let header = |w: u32, h: u32| {
+            vec![
+                0,
+                0,
+                1,
+                0xB3,
+                (w >> 4) as u8,
+                (((w & 0xF) << 4) | (h >> 8)) as u8,
+                h as u8,
+                0x23,
+            ]
+        };
+        assert!(dvd_sized(&header(720, 480)));
+        assert!(dvd_sized(&header(720, 576)));
+        assert!(dvd_sized(&header(352, 240)));
+        assert!(!dvd_sized(&header(721, 480)));
+        assert!(!dvd_sized(&header(720, 577)));
+        assert!(!dvd_sized(&header(1920, 1080)));
+        assert!(!dvd_sized(&[0, 0, 1, 0xB3, 0x2D]));
+        assert!(!dvd_sized(&[0, 0, 1, 0x00, 0x2D, 0x01, 0xE0]));
+    }
+
+    #[test]
+    fn decode_allowance_is_shared() {
+        let mut group = 4;
+        let mut first = Decodes {
+            grab: 3,
+            group: &mut group,
+        };
+        assert!(first.take() && first.take() && first.take());
+        assert!(!first.take(), "per attempt");
+        assert!(first.exhausted());
+        let mut second = Decodes {
+            grab: 3,
+            group: &mut group,
+        };
+        assert!(second.take());
+        assert!(!second.take(), "per group");
+        assert_eq!(group, 0);
     }
 
     #[test]

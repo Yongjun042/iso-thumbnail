@@ -9,7 +9,8 @@
 //! ```
 //!
 //! Modes:
-//! - `extract`: run the parser in-process and write the raw artwork file.
+//! - `extract`: run the parser in-process and write the artwork file as stored
+//!   on the disc, or a PNG at display size for a decoded DVD picture.
 //! - `com`: load IsoPreview.dll, create the COM object through its class
 //!   factory and call `IThumbnailProvider::GetThumbnail`; write a PNG.
 //! - `shell`: ask the Windows shell (`IShellItemImageFactory`) for the

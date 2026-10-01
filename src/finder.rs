@@ -149,7 +149,14 @@ fn best_image_in<F: FileSystem>(
     Ok(first_readable(fs, candidates))
 }
 
-pub fn find_thumbnail<F: FileSystem>(fs: &mut F) -> Result<Thumbnail> {
+/// Finds the thumbnail of the file system's disc, in the order described in
+/// the module documentation.
+///
+/// `dvd_searched` says whether the DVD steps (jacket picture, title frame)
+/// already ran on another view of the same disc: a DVD carries the same
+/// files on its UDF and ISO 9660 sides, and the frame search is the costly
+/// part, so it runs at most once. It is set when this call runs them.
+pub fn find_thumbnail<F: FileSystem>(fs: &mut F, dvd_searched: &mut bool) -> Result<Thumbnail> {
     let root = fs.root()?;
     // One pass over the root collects the disc folders and the cover
     // fallbacks: every walk reads the whole directory from the image again.
@@ -190,7 +197,11 @@ pub fn find_thumbnail<F: FileSystem>(fs: &mut F) -> Result<Thumbnail> {
             }
         }
     }
-    if let Some(dir) = &jacket_p {
+    let search_dvd = !*dvd_searched && (jacket_p.is_some() || video_ts.is_some());
+    if search_dvd {
+        *dvd_searched = true;
+    }
+    if let Some(dir) = jacket_p.as_ref().filter(|_| search_dvd) {
         if let Some(t) = dvd::jacket_picture(fs, dir) {
             return Ok(t);
         }
@@ -206,7 +217,7 @@ pub fn find_thumbnail<F: FileSystem>(fs: &mut F) -> Result<Thumbnail> {
         return Ok(t);
     }
     // Last: a frame of the DVD's video, which costs the most reads.
-    if let Some(dir) = &video_ts {
+    if let Some(dir) = video_ts.as_ref().filter(|_| search_dvd) {
         if let Some(t) = dvd::title_frame(fs, dir) {
             return Ok(t);
         }

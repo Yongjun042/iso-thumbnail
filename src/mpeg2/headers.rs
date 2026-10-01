@@ -322,10 +322,15 @@ fn reduce(w: u64, h: u64) -> (u32, u32) {
 
 /// Pixel (sample) aspect ratio as width:height, reduced.
 ///
-/// MPEG-2 signals the display aspect ratio of the display rectangle
-/// (`display_size` when signalled and non-zero, else the picture), so a sample
-/// is DAR × display height / display width wide. MPEG-1 signals the sample
-/// shape directly as height/width. Unknown codes give square samples.
+/// MPEG-2 signals a display aspect ratio (DAR). Taken literally it describes
+/// the display rectangle of the sequence display extension, but real streams
+/// use that rectangle for other things: DVDs signal the 540-wide pan-and-scan
+/// window of a 720-wide 16:9 picture, half-D1 streams a 720-wide display for a
+/// 352-wide picture. Like ffmpeg (and players), the display rectangle is
+/// therefore used only when the shape it gives the whole picture is exactly
+/// 4:3 or 16:9; otherwise the DAR applies to the coded picture, so a sample is
+/// DAR × height / width wide. MPEG-1 signals the sample shape directly as
+/// height/width. Unknown codes give square samples.
 pub fn pixel_aspect(
     mpeg2: bool,
     code: u8,
@@ -344,9 +349,22 @@ pub fn pixel_aspect(
         4 => (221, 100),
         _ => return (1, 1),
     };
+    let (pw, ph) = (u64::from(picture.0), u64::from(picture.1));
     let (dw, dh) = match display_size {
-        Some((w, h)) if w != 0 && h != 0 => (w, h),
-        _ => picture,
+        Some((w, h)) if w != 0 && h != 0 => {
+            let (w, h) = (u64::from(w), u64::from(h));
+            // Whole-picture shape with the display-based sample aspect:
+            // DAR × (h / w) × (pw / ph) = num / den. Every factor is below
+            // 2^14 (sizes) or 222 (DAR terms), so nothing overflows.
+            let num = dar_w * h * pw;
+            let den = dar_h * w * ph;
+            if num * 3 == den * 4 || num * 9 == den * 16 {
+                (w, h)
+            } else {
+                (pw, ph)
+            }
+        }
+        _ => (pw, ph),
     };
-    reduce(dar_w * u64::from(dh), dar_h * u64::from(dw))
+    reduce(dar_w * dh, dar_h * dw)
 }

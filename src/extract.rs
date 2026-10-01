@@ -18,15 +18,21 @@ pub struct Extracted {
     pub bytes_read: u64,
 }
 
-fn try_udf<S: ByteSource>(rd: &mut CachedReader<S>) -> Result<(Thumbnail, String)> {
+fn try_udf<S: ByteSource>(
+    rd: &mut CachedReader<S>,
+    dvd_searched: &mut bool,
+) -> Result<(Thumbnail, String)> {
     let mut fs = Udf::open(rd)?;
-    let thumb = find_thumbnail(&mut fs)?;
+    let thumb = find_thumbnail(&mut fs, dvd_searched)?;
     Ok((thumb, fs.description()))
 }
 
-fn try_iso9660<S: ByteSource>(rd: &mut CachedReader<S>) -> Result<(Thumbnail, String)> {
+fn try_iso9660<S: ByteSource>(
+    rd: &mut CachedReader<S>,
+    dvd_searched: &mut bool,
+) -> Result<(Thumbnail, String)> {
     let mut fs = Iso9660::open(rd)?;
-    let thumb = find_thumbnail(&mut fs)?;
+    let thumb = find_thumbnail(&mut fs, dvd_searched)?;
     Ok((thumb, fs.description()))
 }
 
@@ -34,9 +40,11 @@ fn try_iso9660<S: ByteSource>(rd: &mut CachedReader<S>) -> Result<(Thumbnail, St
 /// discs are UDF 2.50 and DVDs UDF 1.02; ISO 9660 (with Joliet) is the fallback.
 pub fn extract_thumbnail<S: ByteSource>(src: S) -> Result<Extracted> {
     let mut rd = CachedReader::new(src)?;
-    let (thumbnail, filesystem) = match try_udf(&mut rd) {
+    // Shared by both passes so a DVD's frame search runs once.
+    let mut dvd_searched = false;
+    let (thumbnail, filesystem) = match try_udf(&mut rd, &mut dvd_searched) {
         Ok(found) => found,
-        Err(udf_err) => match try_iso9660(&mut rd) {
+        Err(udf_err) => match try_iso9660(&mut rd, &mut dvd_searched) {
             Ok(found) => found,
             Err(Error::NoVolume) => return Err(udf_err),
             Err(iso_err) => return Err(iso_err),

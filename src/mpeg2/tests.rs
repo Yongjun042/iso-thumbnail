@@ -247,8 +247,9 @@ fn sequence_header_and_extensions_parse() {
         .expect("display extension");
     assert!(seq.bt709);
     assert_eq!(seq.display_size, Some((704, 480)));
-    // 16:9 on a 704-wide display window.
-    assert_eq!(seq.pixel_aspect(), (40, 33));
+    // 16:9 with a 704-wide display window: the window does not make the
+    // whole picture 16:9, so the aspect applies to the coded 720 x 480.
+    assert_eq!(seq.pixel_aspect(), (32, 27));
 
     // A sequence header without a matrix restores the default one.
     cfg.intra_matrix = None;
@@ -336,10 +337,25 @@ fn pixel_aspect_ratios() {
     assert_eq!(pixel_aspect(true, 3, (1920, 1080), none), (1, 1));
     assert_eq!(pixel_aspect(true, 3, (1440, 1080), none), (4, 3));
     assert_eq!(pixel_aspect(true, 4, (720, 480), none), (221, 150));
+    // Display rectangles that do not make the whole picture exactly 4:3 or
+    // 16:9 are ignored, as ffmpeg does: DVD pan-and-scan windows (540 wide on
+    // 720), 704-wide windows, half-D1 pictures with a 720-wide display.
+    assert_eq!(pixel_aspect(true, 2, (720, 480), Some((704, 480))), (8, 9));
     assert_eq!(
-        pixel_aspect(true, 2, (720, 480), Some((704, 480))),
-        (10, 11)
+        pixel_aspect(true, 3, (720, 480), Some((540, 480))),
+        (32, 27)
     );
+    assert_eq!(
+        pixel_aspect(true, 3, (720, 576), Some((540, 576))),
+        (64, 45)
+    );
+    assert_eq!(
+        pixel_aspect(true, 2, (352, 480), Some((720, 480))),
+        (20, 11)
+    );
+    // A display rectangle that keeps the whole picture 4:3 is used.
+    assert_eq!(pixel_aspect(true, 2, (720, 480), Some((720, 480))), (8, 9));
+    assert_eq!(pixel_aspect(true, 2, (720, 480), Some((360, 240))), (8, 9));
     // A zero display size falls back to the picture size.
     assert_eq!(pixel_aspect(true, 2, (720, 480), Some((0, 480))), (8, 9));
     for code in [0, 5, 9, 15] {
@@ -537,7 +553,8 @@ fn signalling_reaches_the_frame() {
     });
     cfg.aspect_code = 2;
     let frame = assert_exact("bt709", &cfg, 720, 480, flat(grey));
-    assert_eq!(frame.pixel_aspect, (10, 11));
+    // The 704-wide window does not make the picture 4:3: coded size wins.
+    assert_eq!(frame.pixel_aspect, (8, 9));
     assert_eq!(frame.matrix, ColorMatrix::Bt709);
 
     cfg.display = Some(DisplayExtension {

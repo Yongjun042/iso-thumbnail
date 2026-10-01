@@ -519,3 +519,176 @@ fn damaged_dvds_never_panic() {
         on_every_file_system(&files, |_, _| {});
     }
 }
+
+// ----------------------------------------------------------------------------
+// Hostile and unusual layouts
+// ----------------------------------------------------------------------------
+
+/// A tiny I-picture that declares a `width` x `height` sequence and carries
+/// one broken slice (quantiser_scale_code 0 is forbidden), so the decoder sets
+/// up the picture and then decodes nothing.
+fn empty_picture(width: u32, height: u32) -> Vec<u8> {
+    let cfg = cfg(false);
+    let mut unit = mpeg2_writer::sequence_headers(&cfg, width, height);
+    let picture = mpeg2_writer::picture(&cfg, 16, 16, |_, _| {
+        mpeg2_writer::MbContent::flat(128, 128, 128)
+    });
+    let first_slice = picture
+        .windows(4)
+        .position(|w| w == [0, 0, 1, 1])
+        .expect("the writer emits a slice");
+    unit.extend_from_slice(&picture[..first_slice]);
+    unit.extend_from_slice(&[0, 0, 1, 1, 0x00, 0x00]);
+    unit
+}
+
+/// Packs an elementary stream as densely as a program stream allows: full
+/// 2048-byte packs with one video PES packet each and no regard for picture
+/// boundaries, so tiny pictures follow each other within one packet.
+fn dense_vob(es: &[u8]) -> Vec<u8> {
+    const PACK_HEADER: [u8; 14] = [
+        0, 0, 1, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3, 0xF8,
+    ];
+    const PAYLOAD: usize = SECTOR - PACK_HEADER.len() - 9;
+    let mut out = Vec::with_capacity(es.len() / PAYLOAD * SECTOR + SECTOR);
+    for chunk in es.chunks(PAYLOAD) {
+        out.extend_from_slice(&PACK_HEADER);
+        let len = (3 + chunk.len()) as u16;
+        out.extend_from_slice(&[0, 0, 1, 0xE0]);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&[0x80, 0x00, 0x00]);
+        out.extend_from_slice(chunk);
+    }
+    out
+}
+
+fn plain_vob(es: &[u8]) -> Vec<u8> {
+    let opts = PsOptions {
+        end_code: false,
+        ..PsOptions::default()
+    };
+    mux(es, &opts).data
+}
+
+#[test]
+fn undecodable_pictures_cost_little() {
+    // Tens of thousands of pictures that each fail to decode: the search
+    // gives up after a few decodes per sampling point instead of trying
+    // every one of them.
+    for (width, height) in [(720, 576), (1920, 1088)] {
+        let unit = empty_picture(width, height);
+        let es: Vec<u8> = unit
+            .iter()
+            .copied()
+            .cycle()
+            .take(unit.len() * 40_000)
+            .collect();
+        let files = vec![
+            ("VIDEO_TS/VTS_01_1.VOB", dense_vob(&es)),
+            ("VIDEO_TS/VTS_02_1.VOB", dense_vob(&es[..es.len() / 2])),
+        ];
+        let started = std::time::Instant::now();
+        on_every_file_system(&files, |fs, result| {
+            assert_eq!(result.err(), Some(Error::NotFound), "{fs}");
+        });
+        let elapsed = started.elapsed();
+        // Unbounded, this took minutes; bounded it takes milliseconds (the
+        // limit is loose for debug builds and slow machines).
+        assert!(elapsed.as_secs() < 20, "{width}x{height}: {elapsed:?}");
+    }
+}
+
+#[test]
+fn titles_that_fail_leave_room_for_the_menus() {
+    let unit = empty_picture(720, 480);
+    let junk: Vec<u8> = unit
+        .iter()
+        .copied()
+        .cycle()
+        .take(unit.len() * 5_000)
+        .collect();
+    let files = vec![
+        ("VIDEO_TS/VIDEO_TS.VOB", vob(&[RED; 2], 1000, false)),
+        ("VIDEO_TS/VTS_01_1.VOB", plain_vob(&junk)),
+        ("VIDEO_TS/VTS_02_1.VOB", plain_vob(&junk[..junk.len() / 2])),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let path = &found.thumbnail.path;
+        assert!(path.contains("(menu)"), "{fs}: {path}");
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn a_picture_at_the_very_end_of_a_vob_is_used() {
+    // One I-picture and nothing after it: no start code terminates it.
+    let mut c = cfg(false);
+    c.sequence_end = false;
+    let single = plain_vob(&intra_picture(&c, W, H, |x, y| RED.color(x, y)));
+    let files = vec![("VIDEO_TS/VTS_01_1.VOB", single.clone())];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+    // The same as the only usable menu.
+    let files = vec![
+        ("VIDEO_TS/VIDEO_TS.VOB", single),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[BLUE; 4], 3000, true)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert!(found.thumbnail.path.contains("(menu)"), "{fs}");
+    });
+}
+
+#[test]
+fn the_main_title_is_found_among_many_title_sets() {
+    // 70 small title sets, each with a menu, before the main title set.
+    let small = vob(&[BLUE], 500, false);
+    let menu = vob(&[BLUE], 200, false);
+    let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
+    for set in 1..=70 {
+        owned.push((format!("VIDEO_TS/VTS_{set:02}_0.VOB"), menu.clone()));
+        owned.push((format!("VIDEO_TS/VTS_{set:02}_1.VOB"), small.clone()));
+    }
+    owned.push((
+        "VIDEO_TS/VTS_71_1.VOB".to_string(),
+        vob(&[RED; 8], 3000, false),
+    ));
+    let files: Vec<(&str, Vec<u8>)> = owned.iter().map(|(p, d)| (p.as_str(), d.clone())).collect();
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let path = &found.thumbnail.path;
+        assert!(path.contains("VTS_71"), "{fs}: {path}");
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn partly_scrambled_titles_give_no_frame() {
+    // Every other pack scrambled: no picture survives whole, and clear payload
+    // on both sides of a dropped packet is never joined into a frame.
+    let es = title_es(&[BLUE; 12], 3000, false);
+    let clear = plain_vob(&es);
+    let scrambled = mux(
+        &es,
+        &PsOptions {
+            scrambled: true,
+            end_code: false,
+            ..PsOptions::default()
+        },
+    )
+    .data;
+    assert_eq!(clear.len(), scrambled.len());
+    let mut mixed = clear.clone();
+    for (i, pack) in mixed.chunks_exact_mut(SECTOR).enumerate() {
+        if i % 2 == 1 {
+            pack.copy_from_slice(&scrambled[i * SECTOR..(i + 1) * SECTOR]);
+        }
+    }
+    let files = vec![("VIDEO_TS/VTS_01_1.VOB", mixed)];
+    on_every_file_system(&files, |fs, result| {
+        assert_eq!(result.err(), Some(Error::NotFound), "{fs}");
+    });
+}
