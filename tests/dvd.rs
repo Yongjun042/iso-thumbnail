@@ -1402,3 +1402,50 @@ fn the_title_menu_jump_is_followed_before_other_title_sets() {
         assert!(is_red(picture(&found)), "{fs}");
     });
 }
+
+#[test]
+fn a_damaged_located_menu_does_not_block_the_last_resort() {
+    // The IFO's root menu decodes but half of it is missing (rejected as
+    // too damaged), the titles are scrambled: the menu VOB start is used.
+    let c = cfg(false);
+    let whole = intra_picture(&c, W, H, |x, y| BLUE.color(x, y));
+    let mut broken = whole[..whole.len() / 2].to_vec();
+    broken.extend_from_slice(&mpeg2_writer::SEQUENCE_END);
+    let files = vec![
+        ("VIDEO_TS/VIDEO_TS.VOB", vob(&[RED; 2], 500, false)),
+        ("VIDEO_TS/VTS_01_0.IFO", menu_ifo("VTS", &[(3, 0, 0)])),
+        ("VIDEO_TS/VTS_01_0.VOB", plain_vob(&broken)),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[GREEN; 8], 3000, true)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(found.thumbnail.path, "VIDEO_TS/VIDEO_TS.VOB (menu)", "{fs}");
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn reading_only_menus_does_not_count_as_searched() {
+    use iso_preview::finder::find_thumbnail;
+    // The title VOB cannot be read on this view (its File Entry is broken),
+    // the menu VOB can but shows nothing presentable.
+    let title = vob(&[RED; 4], 3000, false);
+    let menu = vob(&[Look::Black; 2], 500, false);
+    let files: [(&str, &[u8]); 2] = [
+        ("VIDEO_TS/VIDEO_TS.VOB", &menu),
+        ("VIDEO_TS/VTS_01_1.VOB", &title),
+    ];
+    let mut image = udf102(&files, UdfOptions::default());
+    let fe = image
+        .chunks_exact(SECTOR)
+        .position(|s| {
+            s[0..2] == 261u16.to_le_bytes() && s[56..64] == (title.len() as u64).to_le_bytes()
+        })
+        .expect("file entry of the title VOB");
+    image[fe * SECTOR + 4] ^= 0xFF;
+    let mut rd = reader(image);
+    let mut fs = Udf::open(&mut rd).unwrap();
+    let mut searched = false;
+    let _ = find_thumbnail(&mut fs, &mut searched);
+    assert!(!searched);
+}

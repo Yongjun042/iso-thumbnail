@@ -157,8 +157,8 @@ fn best_image_in<F: FileSystem>(
 /// frames) already ran on another view of the same disc: a DVD carries the
 /// same files on its UDF and ISO 9660 sides, and the video search is the
 /// costly part, so it runs at most once. It is set once this call actually
-/// read video packets from the DVD's VOBs; a view whose VOBs cannot be read
-/// leaves it unset, so the other view still gets its turn.
+/// read video packets from the DVD's title VOBs; a view whose title VOBs
+/// cannot be read leaves it unset, so the other view still gets its turn.
 pub fn find_thumbnail<F: FileSystem>(fs: &mut F, dvd_searched: &mut bool) -> Result<Thumbnail> {
     let root = fs.root()?;
     // One pass over the root collects the disc folders and the cover

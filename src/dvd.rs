@@ -641,8 +641,9 @@ fn title_menu<F: FileSystem>(
 /// module documentation). `None` when nothing decodable was found.
 ///
 /// `searched` is set once video packets were actually read from the disc's
-/// VOBs, so that the caller does not repeat the search on another view of the
-/// same disc; a view whose VOBs cannot be read leaves it unset.
+/// title VOBs, so that the caller does not repeat the search on another view
+/// of the same disc; a view whose title VOBs cannot be read leaves it unset
+/// (reading only menus does not count).
 pub fn video_picture<F: FileSystem>(
     fs: &mut F,
     video_ts: &F::Node,
@@ -657,11 +658,6 @@ pub fn video_picture<F: FileSystem>(
     let mut order: Vec<usize> = (1..sets.len()).filter(|&i| sets[i].total > 0).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(sets[i].total));
     let mut selection = Selection::default();
-    let mut note = |grab: &Grab| {
-        if grab.saw_video() {
-            *searched = true;
-        }
-    };
 
     // 1. Menus the IFO files point at: the main title set's root menu, the
     // title menu (or the root menu it jumps to), then the root menus of the
@@ -706,22 +702,24 @@ pub fn video_picture<F: FileSystem>(
             continue;
         };
         for &sector in &menu.sectors {
-            if attempts >= MAX_AUTHORED_MENU_ATTEMPTS {
+            if attempts >= MAX_AUTHORED_MENU_ATTEMPTS || decodes == 0 {
                 break 'menus;
             }
             attempts += 1;
-            tried.push((menu.set, sector));
             let start = u64::from(sector) * PACK;
             let grab = grab_frame(fs, &[&menu.vob], start, MENU_SCAN_BYTES, &mut decodes);
-            note(&grab);
+            if grab.saw_video() {
+                // Step 3 need not look at this position again.
+                tried.push((menu.set, sector));
+            }
             let source = format!("VIDEO_TS/{} ({})", menu.name, menu.label);
             let candidate = match grab {
-                Grab::Frame(frame) => {
-                    authored_decoded = true;
-                    Candidate::new(frame, source)
-                }
+                Grab::Frame(frame) => Candidate::new(frame, source),
                 Grab::Scrambled | Grab::Nothing { .. } => None,
             };
+            // Only a menu picture that is kept counts: a damaged one must
+            // not keep step 3 from finding something.
+            authored_decoded |= candidate.is_some();
             if selection.offer(candidate) {
                 break 'menus;
             }
@@ -742,7 +740,10 @@ pub fn video_picture<F: FileSystem>(
                 let start = (u128::from(total) * u128::from(permille) / 1000) as u64;
                 let source = format!("VIDEO_TS/VTS_{i:02} title at {}%", permille / 10);
                 let grab = grab_frame(fs, &parts, start, MAX_SCAN_BYTES, &mut decodes);
-                note(&grab);
+                // Title video was read: this view of the disc is searched.
+                if grab.saw_video() {
+                    *searched = true;
+                }
                 let candidate = match grab {
                     Grab::Frame(frame) => Candidate::new(frame, source),
                     // Every part of a scrambled title is scrambled.
@@ -779,7 +780,6 @@ pub fn video_picture<F: FileSystem>(
             attempts += 1;
             let source = format!("VIDEO_TS/{name} (menu)");
             let grab = grab_frame(fs, &[&vob], 0, MAX_SCAN_BYTES, &mut decodes);
-            note(&grab);
             let candidate = match grab {
                 Grab::Frame(frame) => Candidate::new(frame, source),
                 Grab::Scrambled | Grab::Nothing { .. } => None,

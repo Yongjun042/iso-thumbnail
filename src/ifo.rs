@@ -54,6 +54,9 @@ const MAX_COMMANDS: usize = 128;
 const MAX_LINK_DEPTH: usize = 4;
 /// Positions returned per menu.
 const MAX_POSITIONS: usize = 3;
+/// Most PGC visits and commands examined in one table: a crafted table can
+/// list the same router many times over, and this keeps it to microseconds.
+const MAX_STEPS: usize = 4096;
 
 /// Which menu to look for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +220,24 @@ fn positions(pgc: &[u8], sectors: u32) -> Option<Vec<u32>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// The state of one walk over a language unit's PGCs.
+struct Walk {
+    /// PGCs already looked at, from any entry PGC of the unit.
+    visited: [bool; MAX_UNITS],
+    /// PGC visits and commands left for the whole table.
+    steps: usize,
+}
+
+impl Walk {
+    fn step(&mut self) -> bool {
+        if self.steps == 0 {
+            return false;
+        }
+        self.steps -= 1;
+        true
+    }
+}
+
 /// Where PGC `index` of `unit` leads: its own cells, or (for a router without
 /// usable cells) wherever its pre-commands link or jump to.
 fn resolve(
@@ -225,9 +246,12 @@ fn resolve(
     menu: Menu,
     sectors: u32,
     depth: usize,
-    visited: &mut [bool; MAX_UNITS],
+    walk: &mut Walk,
 ) -> Option<MenuLocation> {
-    if depth > MAX_LINK_DEPTH || std::mem::replace(visited.get_mut(index)?, true) {
+    if depth > MAX_LINK_DEPTH
+        || !walk.step()
+        || std::mem::replace(walk.visited.get_mut(index)?, true)
+    {
         return None;
     }
     let (_, pgc) = unit.pgc(index)?;
@@ -240,6 +264,9 @@ fn resolve(
     }
     let pre = usize::from(be16(pgc, table)?).min(MAX_COMMANDS);
     for i in 0..pre {
+        if !walk.step() {
+            return None;
+        }
         let at = table + 8 + i * 8;
         let Some(c) = pgc.get(at..at + 8) else {
             break;
@@ -264,7 +291,7 @@ fn resolve(
             menu,
             sectors,
             depth + 1,
-            visited,
+            walk,
         ) {
             return Some(found);
         }
@@ -273,14 +300,25 @@ fn resolve(
 }
 
 /// Finds `menu` in the menu PGCI unit table `table` whose menu VOB is
-/// `sectors` long. Language units are tried in order; within one, the entry
-/// PGC of the wanted menu type and whatever it links to.
+/// `sectors` long. Language units are tried in order (each distinct unit
+/// once); within one, the entry PGC of the wanted menu type and whatever it
+/// links to. The work is bounded by `MAX_STEPS` for the whole table.
 pub fn find_menu(table: &[u8], menu: Menu, sectors: u32) -> Option<MenuLocation> {
     let units = usize::from(be16(table, 0)?).min(MAX_UNITS);
+    let mut steps = MAX_STEPS;
+    let mut seen = Vec::with_capacity(units);
     for u in 0..units {
         let unit_at = be32(table, 8 + u * 8 + 4)? as usize;
+        if seen.contains(&unit_at) {
+            continue;
+        }
+        seen.push(unit_at);
         let Some(unit) = table.get(unit_at..).and_then(Unit::new) else {
             continue;
+        };
+        let mut walk = Walk {
+            visited: [false; MAX_UNITS],
+            steps,
         };
         for index in 0..unit.pgcs {
             let Some((category, _)) = unit.pgc(index) else {
@@ -289,10 +327,13 @@ pub fn find_menu(table: &[u8], menu: Menu, sectors: u32) -> Option<MenuLocation>
             if category & 0x80 == 0 || category & 0x0F != menu.id() {
                 continue;
             }
-            let mut visited = [false; MAX_UNITS];
-            if let Some(found) = resolve(&unit, index, menu, sectors, 0, &mut visited) {
+            if let Some(found) = resolve(&unit, index, menu, sectors, 0, &mut walk) {
                 return Some(found);
             }
+        }
+        steps = walk.steps;
+        if steps == 0 {
+            break;
         }
     }
     None
@@ -475,6 +516,50 @@ mod tests {
             &[(0x83, &[(7, 9)], &[])],
         ]);
         assert_eq!(find_menu(&t, Menu::Root, 100), sectors(&[7, 9]));
+    }
+
+    #[test]
+    fn crafted_router_tables_cost_little() {
+        // 100 language units sharing one unit of 100 entry routers that all
+        // point at one PGC whose 128 pre-commands link everywhere.
+        let commands: Vec<[u8; 8]> = (0..128).map(|i| link_pgcn(1 + (i % 100) as u16)).collect();
+        let mut pgcs: Vec<Pgc> = vec![(0x83, &[], &commands)];
+        for _ in 1..100 {
+            pgcs.push((0x83, &[], &[]));
+        }
+        let mut t = table(&[&pgcs]);
+        // Point every search pointer at the first PGC and add 99 more
+        // language unit entries for the same unit.
+        let unit_at = u32::from_be_bytes(t[12..16].try_into().unwrap()) as usize;
+        let first_pgc = u32::from_be_bytes(t[unit_at + 12..unit_at + 16].try_into().unwrap());
+        for i in 1..100 {
+            let srp = unit_at + 8 + i * 8 + 4;
+            t[srp..srp + 4].copy_from_slice(&first_pgc.to_be_bytes());
+        }
+        let mut entries = Vec::new();
+        for _ in 0..100 {
+            entries.extend_from_slice(&t[8..16]);
+        }
+        let body = t[16..].to_vec();
+        let shift = (entries.len() - 8) as u32;
+        let mut crafted = vec![0u8; 8];
+        crafted[0..2].copy_from_slice(&100u16.to_be_bytes());
+        crafted.extend(entries);
+        for e in crafted[8..].chunks_exact_mut(8) {
+            let at = u32::from_be_bytes(e[4..8].try_into().unwrap()) + shift;
+            e[4..8].copy_from_slice(&at.to_be_bytes());
+        }
+        crafted.extend(body);
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            assert_eq!(find_menu(&crafted, Menu::Root, BIG), None);
+            assert_eq!(find_menu(&crafted, Menu::Title, BIG), None);
+        }
+        assert!(
+            started.elapsed().as_millis() < 500,
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
