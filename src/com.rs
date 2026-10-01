@@ -26,7 +26,8 @@ use windows::Win32::UI::Shell::{
 };
 
 use crate::error::Error as ParseError;
-use crate::image::decode_to_dib;
+use crate::finder::Content;
+use crate::image::{decode_to_dib, picture_to_dib};
 use crate::reader::ByteSource;
 
 /// CLSID of the handler: {C767266A-4032-4099-9A92-F91D1FE98122}.
@@ -160,7 +161,10 @@ fn render(stream: IStream, cx: u32) -> Result<(HBITMAP, WTS_ALPHATYPE)> {
     let found = crate::extract_thumbnail(StreamSource(stream))
         .map_err(|_| windows::core::Error::from(E_FAIL))?;
     let max_side = if cx == 0 { 256 } else { cx };
-    let decoded = decode_to_dib(&found.thumbnail.data, max_side)?;
+    let decoded = match &found.thumbnail.content {
+        Content::Encoded(data) => decode_to_dib(data, max_side)?,
+        Content::Picture(picture) => picture_to_dib(picture, max_side)?,
+    };
     let alpha = if decoded.has_alpha {
         WTSAT_ARGB
     } else {

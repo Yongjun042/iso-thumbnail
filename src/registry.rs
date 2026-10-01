@@ -27,7 +27,7 @@ use windows::Win32::System::Registry::{
 use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
 
 pub const CLSID_TEXT: &str = "{C767266A-4032-4099-9A92-F91D1FE98122}";
-pub const HANDLER_NAME: &str = "ISO Blu-ray Thumbnail Provider";
+pub const HANDLER_NAME: &str = "ISO Blu-ray and DVD Thumbnail Provider";
 const THUMBNAIL_HANDLER_IID: &str = "{E357FCCD-A995-4576-B01F-234630154E96}";
 const APPROVED_PATH: &str =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved";

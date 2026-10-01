@@ -1,4 +1,4 @@
-//! Top-level "give me the artwork of this image" entry point.
+//! Top-level "give me the thumbnail of this image" entry point.
 
 use crate::error::{Error, Result};
 use crate::finder::{find_thumbnail, Thumbnail};
@@ -30,8 +30,8 @@ fn try_iso9660<S: ByteSource>(rd: &mut CachedReader<S>) -> Result<(Thumbnail, St
     Ok((thumb, fs.description()))
 }
 
-/// Finds the artwork in a disc image. UDF is tried first because Blu-ray
-/// discs are UDF 2.50; ISO 9660 (with Joliet) is the fallback.
+/// Finds the thumbnail of a disc image. UDF is tried first because Blu-ray
+/// discs are UDF 2.50 and DVDs UDF 1.02; ISO 9660 (with Joliet) is the fallback.
 pub fn extract_thumbnail<S: ByteSource>(src: S) -> Result<Extracted> {
     let mut rd = CachedReader::new(src)?;
     let (thumbnail, filesystem) = match try_udf(&mut rd) {

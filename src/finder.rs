@@ -3,10 +3,14 @@
 //! Search order:
 //! 1. `BDMV/META/DL/*.jpg` – Blu-ray Disc Library thumbnails (the standard place).
 //! 2. `BDMV/META/TN/*.jpg` – Blu-ray track-name thumbnails.
-//! 3. `cover.jpg`, `folder.jpg`, … in the root directory of any data disc.
+//! 3. `JACKET_P/J00___5L.MP2` – the DVD-Video jacket picture (see `crate::dvd`).
+//! 4. `cover.jpg`, `folder.jpg`, … in the root directory of any data disc.
+//! 5. A frame of the DVD-Video main title (`VIDEO_TS`), or of its menus.
 
+use crate::dvd;
 use crate::error::{Error, Result};
 use crate::fs::{DirEntry, FileSystem};
+use crate::picture::Picture;
 
 /// Largest artwork file we are willing to load. Blu-ray thumbnails are a few
 /// hundred KiB; this only limits the root-level cover fallback.
@@ -26,12 +30,20 @@ const ROOT_COVER_NAMES: [&str; 7] = [
     "artwork",
 ];
 
+/// What a thumbnail is made from.
+#[derive(Debug)]
+pub enum Content {
+    /// An encoded picture file (JPEG, PNG, GIF or BMP) still to be decoded.
+    Encoded(Vec<u8>),
+    /// A picture already decoded from MPEG video (DVD jacket or title frame).
+    Picture(Picture),
+}
+
 #[derive(Debug)]
 pub struct Thumbnail {
-    /// Path of the picked file inside the image, for diagnostics.
+    /// Where the picture came from inside the image, for diagnostics.
     pub path: String,
-    /// Raw encoded image bytes (JPEG/PNG/...).
-    pub data: Vec<u8>,
+    pub content: Content,
 }
 
 fn split_ext(name: &str) -> (&str, &str) {
@@ -98,7 +110,10 @@ fn first_readable<F: FileSystem>(
             continue;
         }
         if let Ok(data) = fs.read(&node, MAX_IMAGE_BYTES) {
-            return Some(Thumbnail { path, data });
+            return Some(Thumbnail {
+                path,
+                content: Content::Encoded(data),
+            });
         }
     }
     None
@@ -136,14 +151,25 @@ fn best_image_in<F: FileSystem>(
 
 pub fn find_thumbnail<F: FileSystem>(fs: &mut F) -> Result<Thumbnail> {
     let root = fs.root()?;
-    // One pass over the root collects both the BDMV folder and the cover
+    // One pass over the root collects the disc folders and the cover
     // fallbacks: every walk reads the whole directory from the image again.
     let mut bdmv = None;
+    let mut video_ts = None;
+    let mut jacket_p = None;
     let mut covers = Vec::new();
     fs.walk(&root, &mut |e| {
         if e.is_dir {
-            if bdmv.is_none() && e.name.eq_ignore_ascii_case("BDMV") {
-                bdmv = Some(e.node);
+            let slot = if e.name.eq_ignore_ascii_case("BDMV") {
+                &mut bdmv
+            } else if e.name.eq_ignore_ascii_case("VIDEO_TS") {
+                &mut video_ts
+            } else if e.name.eq_ignore_ascii_case("JACKET_P") {
+                &mut jacket_p
+            } else {
+                return true;
+            };
+            if slot.is_none() {
+                *slot = Some(e.node);
             }
         } else if has_image_ext(&e.name)
             && is_cover_name(&e.name)
@@ -164,6 +190,11 @@ pub fn find_thumbnail<F: FileSystem>(fs: &mut F) -> Result<Thumbnail> {
             }
         }
     }
+    if let Some(dir) = &jacket_p {
+        if let Some(t) = dvd::jacket_picture(fs, dir) {
+            return Ok(t);
+        }
+    }
     // Root covers in the priority order of ROOT_COVER_NAMES.
     let candidates = ROOT_COVER_NAMES.iter().flat_map(|wanted| {
         covers
@@ -171,7 +202,16 @@ pub fn find_thumbnail<F: FileSystem>(fs: &mut F) -> Result<Thumbnail> {
             .filter(|e| split_ext(&e.name).0.eq_ignore_ascii_case(wanted))
             .map(|e| (e.name.clone(), e.node.clone()))
     });
-    first_readable(fs, candidates).ok_or(Error::NotFound)
+    if let Some(t) = first_readable(fs, candidates) {
+        return Ok(t);
+    }
+    // Last: a frame of the DVD's video, which costs the most reads.
+    if let Some(dir) = &video_ts {
+        if let Some(t) = dvd::title_frame(fs, dir) {
+            return Ok(t);
+        }
+    }
+    Err(Error::NotFound)
 }
 
 #[cfg(test)]

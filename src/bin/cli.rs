@@ -44,6 +44,9 @@ use windows::Win32::UI::Shell::{
     WTS_ALPHATYPE,
 };
 
+use iso_preview::finder::Content;
+use iso_preview::image::picture_to_dib;
+use iso_preview::picture::Picture;
 use iso_preview::reader::SeekSource;
 use iso_preview::registry::{self, Scope};
 
@@ -166,6 +169,17 @@ fn save_png(bitmap: HBITMAP, path: &Path) -> windows::core::Result<(u32, u32)> {
     }
 }
 
+/// Writes a decoded video picture as a PNG at its on-screen size.
+fn save_picture(picture: &Picture, path: &Path) -> windows::core::Result<(u32, u32)> {
+    let (dw, dh) = picture.display_size();
+    let decoded = picture_to_dib(picture, dw.max(dh))?;
+    let saved = save_png(decoded.bitmap, path);
+    unsafe {
+        let _ = DeleteObject(decoded.bitmap.into());
+    }
+    saved
+}
+
 type DllGetClassObjectFn =
     unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
@@ -237,18 +251,46 @@ fn run_thumbnail(opts: &Opts) -> ExitCode {
                 Ok(found) => {
                     println!("filesystem : {}", found.filesystem);
                     println!("thumbnail  : {}", found.thumbnail.path);
-                    println!("bytes      : {}", found.thumbnail.data.len());
+                    match &found.thumbnail.content {
+                        Content::Encoded(data) => println!("bytes      : {}", data.len()),
+                        Content::Picture(p) => {
+                            let (dw, dh) = p.display_size();
+                            println!(
+                                "picture    : {}x{} decoded, {dw}x{dh} on screen (pixel aspect {}:{})",
+                                p.width, p.height, p.pixel_aspect.0, p.pixel_aspect.1
+                            );
+                        }
+                    }
                     println!("image reads: {} ({} bytes)", found.reads, found.bytes_read);
                     println!("elapsed    : {:.2} ms", elapsed.as_secs_f64() * 1000.0);
-                    let out = out.unwrap_or_else(|| {
-                        image.with_extension(format!("thumb.{}", guess_ext(&found.thumbnail.data)))
-                    });
-                    if let Err(e) = std::fs::write(&out, &found.thumbnail.data) {
-                        eprintln!("cannot write {}: {e}", out.display());
-                        return ExitCode::from(1);
+                    let written = match &found.thumbnail.content {
+                        Content::Encoded(data) => {
+                            let out = out.unwrap_or_else(|| {
+                                image.with_extension(format!("thumb.{}", guess_ext(data)))
+                            });
+                            std::fs::write(&out, data)
+                                .map(|_| out)
+                                .map_err(|e| e.to_string())
+                        }
+                        Content::Picture(p) => {
+                            // Decoded video has no file of its own: save it as a
+                            // PNG at its on-screen size.
+                            let out = out.unwrap_or_else(|| image.with_extension("thumb.png"));
+                            save_picture(p, &out)
+                                .map(|_| out)
+                                .map_err(|e| e.to_string())
+                        }
+                    };
+                    match written {
+                        Ok(out) => {
+                            println!("written    : {}", out.display());
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("cannot write the thumbnail: {e}");
+                            ExitCode::from(1)
+                        }
                     }
-                    println!("written    : {}", out.display());
-                    ExitCode::SUCCESS
                 }
                 Err(e) => {
                     eprintln!(
