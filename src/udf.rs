@@ -30,8 +30,11 @@ const FT_VAT: u8 = 248;
 const MAX_DIR_BYTES: usize = 4 << 20;
 /// Largest virtual allocation table we are willing to load.
 const MAX_VAT_BYTES: usize = 8 << 20;
-/// Most extents one file may consist of (a 16 MiB file needs at most 8192 blocks).
-const MAX_EXTENTS: usize = 2048;
+/// Most extents one file may consist of. A stereoscopic Blu-ray's main clip
+/// is interleaved with its dependent view in a few thousand extents.
+const MAX_EXTENTS: usize = 8192;
+/// Most Allocation Extent Descriptors followed for one file; each is one block.
+const MAX_AED_DEPTH: u32 = 128;
 /// Most blocks scanned in one volume descriptor sequence extent.
 const MAX_VDS_BLOCKS: u32 = 64;
 
@@ -134,6 +137,10 @@ pub struct Udf<'a, S: ByteSource> {
     root: Icb,
     revision: u16,
     has_metadata: bool,
+    /// The file `read_range` read last, with its parsed extents: ranged reads
+    /// of one large file come one after the other, and parsing a fragmented
+    /// file's descriptors again for each would read its AED blocks again.
+    last_file: Option<(Icb, Inode)>,
 }
 
 /// Returns the tag identifier if the 16-byte descriptor tag checksum is valid.
@@ -329,6 +336,7 @@ impl<'a, S: ByteSource> Udf<'a, S> {
             root: Icb { block: 0, part: 0 },
             revision: lvd.revision,
             has_metadata: false,
+            last_file: None,
         };
 
         // Pass 1: maps that address a physical partition directly.
@@ -570,7 +578,7 @@ impl<'a, S: ByteSource> Udf<'a, S> {
             });
         }
         let mut extents = Vec::new();
-        self.parse_ads(ads, ad_type, part, &mut extents, 0)?;
+        self.parse_ads(ads, ad_type, part, &mut extents)?;
         Ok(Inode {
             file_type,
             size,
@@ -579,13 +587,15 @@ impl<'a, S: ByteSource> Udf<'a, S> {
         })
     }
 
+    /// Collects the extents of a file from its allocation descriptors,
+    /// following Allocation Extent Descriptor continuations iteratively (a
+    /// stereoscopic Blu-ray's interleaved main clip needs a few dozen).
     fn parse_ads(
         &mut self,
         ads: &[u8],
         ad_type: u8,
         part: u16,
         out: &mut Vec<Extent>,
-        depth: u32,
     ) -> Result<()> {
         let step = match ad_type {
             0 => 8,
@@ -593,50 +603,60 @@ impl<'a, S: ByteSource> Udf<'a, S> {
             2 => 20,
             _ => return Err(Error::Unsupported("allocation descriptor type")),
         };
-        let mut off = 0usize;
-        while off + step <= ads.len() {
-            let raw = u32le(ads, off)?;
-            let len = raw & 0x3FFF_FFFF;
-            let kind = raw >> 30;
-            if len == 0 {
+        let mut ads = ads.to_vec();
+        let mut part = part;
+        for depth in 0..=MAX_AED_DEPTH {
+            let mut continuation = None;
+            let mut off = 0usize;
+            while off + step <= ads.len() {
+                let raw = u32le(&ads, off)?;
+                let len = raw & 0x3FFF_FFFF;
+                let kind = raw >> 30;
+                if len == 0 {
+                    break;
+                }
+                let (block, p) = match ad_type {
+                    0 => (u32le(&ads, off + 4)?, part),
+                    1 => (u32le(&ads, off + 4)?, u16le(&ads, off + 8)?),
+                    _ => (u32le(&ads, off + 12)?, u16le(&ads, off + 16)?),
+                };
+                off += step;
+                if kind == 3 {
+                    // Continuation: the extent holds an Allocation Extent Descriptor.
+                    continuation = Some((block, p));
+                    break;
+                }
+                if out.len() >= MAX_EXTENTS {
+                    return Err(Error::TooLarge);
+                }
+                let recorded = kind == 0;
+                let sector = if recorded {
+                    self.sector_of(block, p)?
+                } else {
+                    0
+                };
+                out.push(Extent {
+                    sector,
+                    len,
+                    recorded,
+                });
+            }
+            let Some((block, p)) = continuation else {
+                return Ok(());
+            };
+            if depth == MAX_AED_DEPTH {
                 break;
             }
-            let (block, p) = match ad_type {
-                0 => (u32le(ads, off + 4)?, part),
-                1 => (u32le(ads, off + 4)?, u16le(ads, off + 8)?),
-                _ => (u32le(ads, off + 12)?, u16le(ads, off + 16)?),
-            };
-            off += step;
-            if kind == 3 {
-                // Continuation: the extent holds an Allocation Extent Descriptor.
-                if depth >= 8 {
-                    return Err(Error::Corrupt("allocation extent chain too deep"));
-                }
-                let sector = self.sector_of(block, p)?;
-                let blk = self.read_block(sector)?;
-                if tag_id(&blk) != Some(TAG_AED) {
-                    return Err(Error::Corrupt("expected allocation extent descriptor"));
-                }
-                let l_ad = u32le(&blk, 20)? as usize;
-                let next = slice(&blk, 24, l_ad)?.to_vec();
-                return self.parse_ads(&next, ad_type, p, out, depth + 1);
+            let sector = self.sector_of(block, p)?;
+            let blk = self.read_block(sector)?;
+            if tag_id(&blk) != Some(TAG_AED) {
+                return Err(Error::Corrupt("expected allocation extent descriptor"));
             }
-            if out.len() >= MAX_EXTENTS {
-                return Err(Error::TooLarge);
-            }
-            let recorded = kind == 0;
-            let sector = if recorded {
-                self.sector_of(block, p)?
-            } else {
-                0
-            };
-            out.push(Extent {
-                sector,
-                len,
-                recorded,
-            });
+            let l_ad = u32le(&blk, 20)? as usize;
+            ads = slice(&blk, 24, l_ad)?.to_vec();
+            part = p;
         }
-        Ok(())
+        Err(Error::Corrupt("allocation extent chain too deep"))
     }
 
     fn read_data(&mut self, inode: &Inode, max_len: usize) -> Result<Vec<u8>> {
@@ -812,13 +832,19 @@ impl<S: ByteSource> FileSystem for Udf<'_, S> {
     }
 
     fn read_range(&mut self, file: &Icb, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        // The file entry and its allocation descriptors are parsed on every
-        // call (normally one cached block); the file data itself is only read
-        // for the requested range, so a 1 GiB VOB costs no more than a small file.
-        let inode = self.read_inode(*file)?;
+        // The file entry and its allocation descriptors are parsed once per
+        // file and kept for the following calls; the file data itself is only
+        // read for the requested range, so a 1 GiB VOB costs no more than a
+        // small file.
+        let inode = match self.last_file.take() {
+            Some((icb, inode)) if icb == *file => inode,
+            _ => self.read_inode(*file)?,
+        };
         if inode.file_type == FT_DIRECTORY {
             return Err(Error::Corrupt("is a directory"));
         }
-        self.read_inode_range(&inode, offset, buf)
+        let result = self.read_inode_range(&inode, offset, buf);
+        self.last_file = Some((*file, inode));
+        result
     }
 }

@@ -717,6 +717,97 @@ fn udf_read_range_respects_the_read_budget() {
     assert_eq!(fs.read_range(&file, 0, &mut whole), Err(Error::TooLarge));
 }
 
+/// Replaces the file entry of `BDMV/STREAM/00000.m2ts` with one whose
+/// `extents` one-block extents are described `per` at a time: the first in
+/// the file entry, the rest in a chain of Allocation Extent Descriptors.
+/// With `cycle`, the last descriptor continues to the first one again.
+fn udf_with_aed_chain(metadata: bool, extents: u32, per: u32, cycle: bool) -> (Vec<u8>, Vec<u8>) {
+    let mut img = Image {
+        data: build_udf(metadata, true, None),
+    };
+    // Past the anchor (block 156): file data, then the descriptors.
+    let data_block = 210;
+    let groups = extents.div_ceil(per);
+    let aed_block = |k: u32| data_block + extents + k;
+    img.data
+        .resize((PART_START + aed_block(groups)) as usize * SECTOR, 0);
+    let s = SECTOR as u32;
+    let ad = |raw: u32, block: u32| -> Vec<u8> {
+        if metadata {
+            long_ad(raw, block, 0).to_vec()
+        } else {
+            short_ad(raw, block).to_vec()
+        }
+    };
+    let size = extents as u64 * SECTOR as u64;
+    let expected: Vec<u8> = (0..size).map(pattern).collect();
+    img.put((PART_START + data_block) as usize, 0, &expected);
+    // Group g holds extents g*per.. and continues to descriptor g (holding group g+1).
+    let group = |g: u32| -> Vec<u8> {
+        let mut ads = Vec::new();
+        for i in g * per..((g + 1) * per).min(extents) {
+            ads.extend(ad(s, data_block + i));
+        }
+        if g + 1 < groups {
+            ads.extend(ad(s | 3 << 30, aed_block(g)));
+        } else if cycle {
+            ads.extend(ad(s | 3 << 30, aed_block(0)));
+        }
+        ads
+    };
+    let (ad_type, base) = if metadata { (1, 30) } else { (0, 0) };
+    img.put(
+        (PART_START + base + 14) as usize,
+        0,
+        &fe(14, 5, size, ad_type, &group(0)),
+    );
+    for g in 1..groups {
+        let ads = group(g);
+        let mut aed = vec![0u8; 24];
+        aed[..16].copy_from_slice(&tag(258, aed_block(g - 1)));
+        aed[20..24].copy_from_slice(&(ads.len() as u32).to_le_bytes());
+        aed.extend(ads);
+        img.put((PART_START + aed_block(g - 1)) as usize, 0, &aed);
+    }
+    (img.data, expected)
+}
+
+#[test]
+fn udf_follows_long_allocation_extent_chains() {
+    // 40 extents one per descriptor: a chain of 39 Allocation Extent
+    // Descriptors, as an interleaved stereoscopic clip has.
+    for metadata in [false, true] {
+        let (image, expected) = udf_with_aed_chain(metadata, 40, 1, false);
+        let mut rd = CachedReader::new(SeekSource(Cursor::new(image))).unwrap();
+        let mut fs = Udf::open(&mut rd).unwrap();
+        let file = udf_m2ts(&mut fs);
+        assert_eq!(fs.file_size(&file).unwrap(), expected.len() as u64);
+        check_range(&mut fs, &file, &expected, 0, expected.len());
+        for (offset, len) in [(5000, 9000), (2047, 2), (expected.len() as u64 - 1, 10)] {
+            check_range(&mut fs, &file, &expected, offset, len);
+        }
+    }
+}
+
+#[test]
+fn udf_gives_up_on_endless_allocation_extent_chains() {
+    for metadata in [false, true] {
+        // A chain that loops back on itself, and one longer than any real disc's.
+        for (extents, cycle) in [(10, true), (200, false)] {
+            let (image, _) = udf_with_aed_chain(metadata, extents, 1, cycle);
+            let mut rd = CachedReader::new(SeekSource(Cursor::new(image))).unwrap();
+            let mut fs = Udf::open(&mut rd).unwrap();
+            let file = udf_m2ts(&mut fs);
+            let mut buf = vec![0u8; 4096];
+            assert_eq!(
+                fs.read_range(&file, 0, &mut buf),
+                Err(Error::Corrupt("allocation extent chain too deep")),
+                "extents {extents}, cycle {cycle}"
+            );
+        }
+    }
+}
+
 #[test]
 fn iso9660_read_range_reads_the_extent() {
     for joliet in [false, true] {

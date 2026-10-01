@@ -7,7 +7,10 @@
 //! 4. `cover.jpg`, `folder.jpg`, … in the root directory of any data disc.
 //! 5. A picture of the DVD-Video's video (`VIDEO_TS`): its root or title menu,
 //!    else a frame of the main title (see `crate::dvd`).
+//! 6. A key frame of the Blu-ray's main feature (`BDMV/STREAM`), when the disc
+//!    has no artwork (see `crate::bluray`).
 
+use crate::bluray;
 use crate::dvd;
 use crate::error::{Error, Result};
 use crate::fs::{DirEntry, FileSystem};
@@ -153,12 +156,12 @@ fn best_image_in<F: FileSystem>(
 /// Finds the thumbnail of the file system's disc, in the order described in
 /// the module documentation.
 ///
-/// `dvd_searched` says whether the DVD steps (jacket picture, menus and
-/// frames) already ran on another view of the same disc: a DVD carries the
-/// same files on its UDF and ISO 9660 sides, and the video search is the
-/// costly part, so it runs at most once. It is set once this call actually
-/// read video packets from the DVD's title VOBs; a view whose title VOBs
-/// cannot be read leaves it unset, so the other view still gets its turn.
+/// `dvd_searched` says whether the video steps (DVD jacket picture, DVD
+/// menus and frames, Blu-ray frames) already ran on another view of the same
+/// disc: a disc carries the same files on its UDF and ISO 9660 sides, and the
+/// video search is the costly part, so it runs at most once. It is set once
+/// this call actually read video packets; a view whose video files cannot be
+/// read leaves it unset, so the other view still gets its turn.
 pub fn find_thumbnail<F: FileSystem>(fs: &mut F, dvd_searched: &mut bool) -> Result<Thumbnail> {
     let root = fs.root()?;
     // One pass over the root collects the disc folders and the cover
@@ -189,8 +192,8 @@ pub fn find_thumbnail<F: FileSystem>(fs: &mut F, dvd_searched: &mut bool) -> Res
         }
         true
     })?;
-    if let Some(bdmv) = bdmv {
-        if let Some(meta) = fs.lookup(&bdmv, "META", true)? {
+    if let Some(bdmv) = bdmv.as_ref() {
+        if let Some(meta) = fs.lookup(bdmv, "META", true)? {
             for sub in ["DL", "TN"] {
                 if let Some(dir) = fs.lookup(&meta, sub, true)? {
                     if let Some(t) = best_image_in(fs, &dir, &format!("BDMV/META/{sub}"))? {
@@ -219,6 +222,13 @@ pub fn find_thumbnail<F: FileSystem>(fs: &mut F, dvd_searched: &mut bool) -> Res
     // Last: the DVD's menus or a frame of its video, which costs the most.
     if let Some(dir) = video_ts.as_ref().filter(|_| search_dvd) {
         if let Some(t) = dvd::video_picture(fs, dir, dvd_searched) {
+            return Ok(t);
+        }
+    }
+    // `search_dvd` as it was before the DVD step: a disc with both folders
+    // still gets its Blu-ray turn when the DVD video gave nothing.
+    if let Some(dir) = bdmv.as_ref().filter(|_| search_dvd) {
+        if let Some(t) = bluray::video_picture(fs, dir, dvd_searched) {
             return Ok(t);
         }
     }

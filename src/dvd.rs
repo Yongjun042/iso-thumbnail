@@ -425,8 +425,8 @@ fn grab_frame<F: FileSystem>(
     }
 }
 
-/// A decoded frame with what the selection needs.
-struct Candidate {
+/// A decoded frame with what the selection needs (also used for Blu-ray frames).
+pub(crate) struct Candidate {
     frame: Frame,
     area: Rect,
     stats: LumaStats,
@@ -434,7 +434,7 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn new(frame: Frame, source: String) -> Option<Self> {
+    pub(crate) fn new(frame: Frame, source: String) -> Option<Self> {
         if too_damaged(&frame) {
             return None;
         }
@@ -448,7 +448,7 @@ impl Candidate {
         })
     }
 
-    fn into_thumbnail(self) -> Option<Thumbnail> {
+    pub(crate) fn into_thumbnail(self) -> Option<Thumbnail> {
         let picture = picture::to_picture(&self.frame, self.area);
         (picture.width > 0 && picture.height > 0).then_some(Thumbnail {
             path: self.source,
@@ -459,14 +459,14 @@ impl Candidate {
 
 /// Keeps the best frame seen so far.
 #[derive(Default)]
-struct Selection {
-    best: Option<Candidate>,
+pub(crate) struct Selection {
+    pub(crate) best: Option<Candidate>,
 }
 
 impl Selection {
     /// Records the outcome of one attempt. Returns true once a presentable
     /// frame was found.
-    fn offer(&mut self, candidate: Option<Candidate>) -> bool {
+    pub(crate) fn offer(&mut self, candidate: Option<Candidate>) -> bool {
         if let Some(c) = candidate {
             // Once the best is presentable the search stops, so a stored best
             // here is never presentable: a presentable newcomer always wins,
@@ -482,7 +482,7 @@ impl Selection {
         self.found()
     }
 
-    fn found(&self) -> bool {
+    pub(crate) fn found(&self) -> bool {
         self.best.as_ref().is_some_and(|b| presentable(&b.stats))
     }
 }
