@@ -197,19 +197,11 @@ pub fn iso9660(files: &[(&str, &[u8])]) -> Vec<u8> {
 /// First sector of the UDF partition (after the anchor at 256).
 pub const UDF_PART_START: u32 = 272;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct UdfOptions {
     /// Split file data into allocation extents of at most this many blocks
     /// (the extents stay contiguous on disc). `None`: one extent per file.
     pub extent_blocks: Option<u32>,
-}
-
-impl Default for UdfOptions {
-    fn default() -> Self {
-        Self {
-            extent_blocks: None,
-        }
-    }
 }
 
 fn tag(id: u16, location: u32, body: &[u8]) -> [u8; 16] {
@@ -320,7 +312,15 @@ fn udf_file(img: &mut Vec<u8>, layout: &mut UdfLayout, data: &[u8]) -> u32 {
     let blocks = sectors(data.len()) as u32;
     let first = layout.alloc(blocks);
     put(img, part_sector(first) as usize * SECTOR, data);
-    let per = layout.opts.extent_blocks.unwrap_or(u32::MAX).max(1);
+    // The descriptors must fit in the File Entry's block (this builder writes
+    // no Allocation Extent Descriptors), so very long files get longer extents.
+    let max_ads = ((SECTOR - 176) / 8) as u32;
+    let per = layout
+        .opts
+        .extent_blocks
+        .unwrap_or(u32::MAX)
+        .max(blocks.div_ceil(max_ads))
+        .max(1);
     let mut ads = Vec::new();
     if !data.is_empty() {
         // Only the last extent may end inside a block.

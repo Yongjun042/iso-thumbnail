@@ -1,22 +1,51 @@
 //! DVD-Video thumbnails on synthetic disc images.
+//!
+//! The images are built in memory: video elementary streams from
+//! `support/mpeg2_writer.rs` (flat macroblocks of chosen colours, so the
+//! decoded frames are exactly predictable), multiplexed into DVD-like VOBs by
+//! `support/ps_writer.rs`, stored in ISO 9660 and UDF 1.02 images by
+//! `support/disc_builder.rs`. Every scenario runs on each file system.
 
 extern crate IsoPreview as iso_preview;
 
 #[path = "support/disc_builder.rs"]
 mod disc_builder;
+#[allow(dead_code)]
+#[path = "support/mpeg2_writer.rs"]
+mod mpeg2_writer;
+#[allow(dead_code)]
+#[path = "support/ps_writer.rs"]
+mod ps_writer;
 
 use std::io::Cursor;
 
+use iso_preview::error::Error;
+use iso_preview::finder::Content;
 use iso_preview::fs::FileSystem;
 use iso_preview::iso9660::Iso9660;
+use iso_preview::picture::Picture;
 use iso_preview::reader::{CachedReader, SeekSource};
 use iso_preview::udf::Udf;
+use iso_preview::Extracted;
 
-use disc_builder::{iso9660, udf102, UdfOptions};
+use disc_builder::{iso9660, udf102, UdfOptions, SECTOR};
+use mpeg2_writer::{intra_picture, predicted_picture, WriterConfig};
+use ps_writer::{mux, PsOptions};
+
+const W: u32 = 720;
+const H: u32 = 480;
 
 fn reader(image: Vec<u8>) -> CachedReader<SeekSource<Cursor<Vec<u8>>>> {
     CachedReader::new(SeekSource(Cursor::new(image))).unwrap()
 }
+
+fn extract(image: &[u8]) -> Result<Extracted, Error> {
+    iso_preview::extract_thumbnail(SeekSource(Cursor::new(image.to_vec())))
+}
+
+// ----------------------------------------------------------------------------
+// Disc image builders
+// ----------------------------------------------------------------------------
 
 /// Opens every file of `files` by path and checks its size and contents.
 fn open_tree<F: FileSystem>(fs: &mut F, files: &[(&str, &[u8])]) -> Vec<F::Node> {
@@ -54,27 +83,28 @@ fn check_ranges<F: FileSystem>(fs: &mut F, files: &[(&str, &[u8])], nodes: &[F::
     }
 }
 
-fn sample_files() -> Vec<(&'static str, Vec<u8>)> {
+fn sample_files() -> Vec<(String, Vec<u8>)> {
     let pattern = |len: usize, seed: u8| -> Vec<u8> {
         (0..len)
             .map(|i| (i as u32).wrapping_mul(31).wrapping_add(seed as u32) as u8)
             .collect()
     };
     let mut files = vec![
-        ("VIDEO_TS/VIDEO_TS.IFO", pattern(6000, 1)),
-        ("VIDEO_TS/VIDEO_TS.VOB", pattern(10 * 2048, 2)),
-        ("VIDEO_TS/VTS_01_0.IFO", pattern(4096, 3)),
-        ("VIDEO_TS/VTS_01_1.VOB", pattern(123_457, 4)),
-        ("VIDEO_TS/VTS_01_2.VOB", pattern(2048, 5)),
-        ("AUDIO_TS/EMPTY.TXT", Vec::new()),
-        ("JACKET_P/J00___5L.MP2", pattern(777, 6)),
-        ("README.TXT", b"hello".to_vec()),
+        ("VIDEO_TS/VIDEO_TS.IFO".to_string(), pattern(6000, 1)),
+        ("VIDEO_TS/VIDEO_TS.VOB".to_string(), pattern(10 * 2048, 2)),
+        ("VIDEO_TS/VTS_01_0.IFO".to_string(), pattern(4096, 3)),
+        ("VIDEO_TS/VTS_01_1.VOB".to_string(), pattern(123_457, 4)),
+        ("VIDEO_TS/VTS_01_2.VOB".to_string(), pattern(2048, 5)),
+        ("AUDIO_TS/EMPTY.TXT".to_string(), Vec::new()),
+        ("JACKET_P/J00___5L.MP2".to_string(), pattern(777, 6)),
+        ("README.TXT".to_string(), b"hello".to_vec()),
     ];
     // Enough entries for a directory spanning several sectors.
     for i in 0..90 {
-        let name: &'static str =
-            Box::leak(format!("VIDEO_TS/VTS_{:02}_0.BUP", i + 2).into_boxed_str());
-        files.push((name, pattern(100 + i, i as u8)));
+        files.push((
+            format!("VIDEO_TS/VTS_{:02}_0.BUP", i + 2),
+            pattern(100 + i, i as u8),
+        ));
     }
     files
 }
@@ -82,44 +112,410 @@ fn sample_files() -> Vec<(&'static str, Vec<u8>)> {
 #[test]
 fn builders_produce_readable_images() {
     let owned = sample_files();
-    let files: Vec<(&str, &[u8])> = owned.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+    let files: Vec<(&str, &[u8])> = owned
+        .iter()
+        .map(|(p, d)| (p.as_str(), d.as_slice()))
+        .collect();
+    let fragmented = UdfOptions {
+        extent_blocks: Some(3),
+    };
     let images = [
         ("ISO 9660", iso9660(&files)),
         ("UDF", udf102(&files, UdfOptions::default())),
-        (
-            "UDF, 3-block extents",
-            udf102(
-                &files,
-                UdfOptions {
-                    extent_blocks: Some(3),
-                },
-            ),
-        ),
+        ("UDF, 3-block extents", udf102(&files, fragmented)),
     ];
-    // Directory structure and whole-file reads first, then ranged reads.
     for (what, image) in &images {
-        eprintln!("checking {what}");
         let mut rd = reader(image.clone());
         if what.starts_with("UDF") {
             let mut fs = Udf::open(&mut rd).unwrap();
             assert_eq!(fs.description(), "UDF 1.02");
-            open_tree(&mut fs, &files);
+            let nodes = open_tree(&mut fs, &files);
+            check_ranges(&mut fs, &files, &nodes);
         } else {
             let mut fs = Iso9660::open(&mut rd).unwrap();
-            open_tree(&mut fs, &files);
+            let nodes = open_tree(&mut fs, &files);
+            check_ranges(&mut fs, &files, &nodes);
         }
     }
-    for (what, image) in &images {
-        eprintln!("ranges of {what}");
-        let mut rd = reader(image.clone());
-        if what.starts_with("UDF") {
-            let mut fs = Udf::open(&mut rd).unwrap();
-            let nodes = open_tree(&mut fs, &files);
-            check_ranges(&mut fs, &files, &nodes);
-        } else {
-            let mut fs = Iso9660::open(&mut rd).unwrap();
-            let nodes = open_tree(&mut fs, &files);
-            check_ranges(&mut fs, &files, &nodes);
+}
+
+// ----------------------------------------------------------------------------
+// DVD content
+// ----------------------------------------------------------------------------
+
+/// What one group of pictures shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Look {
+    /// Studio black.
+    Black,
+    /// A grey checkerboard (luma 60 / 180) tinted by (cb, cr): presentable.
+    Checker(u8, u8),
+    /// The checkerboard with 64-line black bars at the top and the bottom.
+    Letterboxed(u8, u8),
+    /// A flat mid-grey frame (a title card without detail).
+    Flat,
+}
+
+impl Look {
+    fn color(self, x: u32, y: u32) -> (u8, u8, u8) {
+        let rows = H / 16;
+        match self {
+            Look::Black => (16, 128, 128),
+            Look::Flat => (120, 128, 128),
+            Look::Checker(cb, cr) => (if (x + y) % 2 == 0 { 60 } else { 180 }, cb, cr),
+            Look::Letterboxed(cb, cr) => {
+                if y < 4 || y >= rows - 4 {
+                    (16, 128, 128)
+                } else {
+                    Look::Checker(cb, cr).color(x, y)
+                }
+            }
         }
+    }
+}
+
+fn cfg(mpeg1: bool) -> WriterConfig {
+    let mut cfg = if mpeg1 {
+        WriterConfig::mpeg1()
+    } else {
+        WriterConfig::mpeg2()
+    };
+    cfg.sequence_end = false;
+    cfg
+}
+
+/// A video elementary stream: per look, one GOP of an I-picture followed by
+/// predicted pictures carrying `filler` bytes each (bulk, like real P/B
+/// pictures; the decoder skips them).
+fn title_es(looks: &[Look], filler: usize, mpeg1: bool) -> Vec<u8> {
+    let cfg = cfg(mpeg1);
+    let mut es = Vec::new();
+    for look in looks {
+        es.extend(intra_picture(&cfg, W, H, |x, y| look.color(x, y)));
+        for _ in 0..3 {
+            es.extend(predicted_picture(&cfg, 2));
+            // More slice data without start codes.
+            es.extend(std::iter::repeat_n(0x55u8, filler));
+        }
+    }
+    es
+}
+
+fn vob(looks: &[Look], filler: usize, scrambled: bool) -> Vec<u8> {
+    let opts = PsOptions {
+        scrambled,
+        end_code: false,
+        ..PsOptions::default()
+    };
+    mux(&title_es(looks, filler, false), &opts).data
+}
+
+/// Splits a VOB at a pack boundary near `fraction` of its length, like the
+/// 1 GiB parts of a real title.
+fn split(vob: &[u8], fraction: f64) -> (Vec<u8>, Vec<u8>) {
+    let packs = vob.len() / SECTOR;
+    let cut = ((packs as f64 * fraction) as usize).max(1) * SECTOR;
+    (vob[..cut].to_vec(), vob[cut..].to_vec())
+}
+
+/// Builds each disc layout (ISO 9660, UDF, UDF with fragmented files) and
+/// runs `check` on its extraction result.
+fn on_every_file_system(files: &[(&str, Vec<u8>)], check: impl Fn(&str, Result<Extracted, Error>)) {
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+    check("ISO 9660", extract(&iso9660(&files)));
+    check("UDF", extract(&udf102(&files, UdfOptions::default())));
+    let fragmented = UdfOptions {
+        extent_blocks: Some(37),
+    };
+    check("UDF fragmented", extract(&udf102(&files, fragmented)));
+}
+
+fn picture(found: &Extracted) -> &Picture {
+    match &found.thumbnail.content {
+        Content::Picture(p) => p,
+        Content::Encoded(_) => panic!("{}: expected a decoded picture", found.thumbnail.path),
+    }
+}
+
+/// Average (B, G, R) of a picture.
+fn average(p: &Picture) -> (u32, u32, u32) {
+    let n = (p.width as u64 * p.height as u64).max(1);
+    let mut sum = [0u64; 3];
+    for px in p.bgra.chunks_exact(4) {
+        for c in 0..3 {
+            sum[c] += px[c] as u64;
+        }
+    }
+    (
+        (sum[0] / n) as u32,
+        (sum[1] / n) as u32,
+        (sum[2] / n) as u32,
+    )
+}
+
+const BLUE: Look = Look::Checker(200, 110);
+const RED: Look = Look::Checker(110, 200);
+
+fn is_blue(p: &Picture) -> bool {
+    let (b, _, r) = average(p);
+    b > r + 40
+}
+
+fn is_red(p: &Picture) -> bool {
+    let (b, _, r) = average(p);
+    r > b + 40
+}
+
+fn ifo(kind: &str) -> Vec<u8> {
+    let mut b = vec![0u8; 2048];
+    b[..9].copy_from_slice(b"DVDVIDEO-");
+    b[9..12].copy_from_slice(kind.as_bytes());
+    b
+}
+
+// ----------------------------------------------------------------------------
+// Scenarios
+// ----------------------------------------------------------------------------
+
+#[test]
+fn main_title_is_the_largest_title_set() {
+    let files = vec![
+        ("VIDEO_TS/VIDEO_TS.IFO", ifo("VMG")),
+        ("VIDEO_TS/VTS_01_0.IFO", ifo("VTS")),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[BLUE; 4], 3000, false)),
+        ("VIDEO_TS/VTS_02_0.IFO", ifo("VTS")),
+        ("VIDEO_TS/VTS_02_1.VOB", vob(&[RED; 12], 3000, false)),
+        ("VIDEO_TS/VTS_03_1.VOB", vob(&[BLUE; 2], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let path = &found.thumbnail.path;
+        assert!(path.contains("VTS_02"), "{fs}: {path}");
+        let p = picture(&found);
+        assert_eq!((p.width, p.height), (W, H), "{fs}");
+        assert_eq!(p.pixel_aspect, (8, 9), "{fs}: 4:3 NTSC");
+        assert!(is_red(p), "{fs}: {:?}", average(p));
+    });
+}
+
+#[test]
+fn dark_and_flat_frames_are_passed_over() {
+    // 20 GOPs; the first sampling point (25 %) and its neighbours are black
+    // or flat, the second (40 %) shows the checkerboard. The title is split
+    // in two VOBs so the second sample lies in the second part.
+    let mut looks = vec![BLUE; 20];
+    for (i, look) in looks.iter_mut().enumerate().take(8).skip(3) {
+        *look = if i % 2 == 0 { Look::Black } else { Look::Flat };
+    }
+    let (part1, part2) = split(&vob(&looks, 4000, false), 0.33);
+    let files = vec![
+        ("VIDEO_TS/VTS_01_1.VOB", part1),
+        ("VIDEO_TS/VTS_01_2.VOB", part2),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let path = &found.thumbnail.path;
+        assert!(path.ends_with("at 40%"), "{fs}: {path}");
+        assert!(is_blue(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn letterbox_bars_are_cut() {
+    let files = vec![(
+        "VIDEO_TS/VTS_01_1.VOB",
+        vob(&[Look::Letterboxed(200, 110); 6], 3000, false),
+    )];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let p = picture(&found);
+        assert_eq!((p.width, p.height), (W, H - 128), "{fs}");
+        assert_eq!(p.display_size(), (640, 352), "{fs}");
+        assert!(is_blue(p), "{fs}");
+    });
+}
+
+#[test]
+fn a_short_title_is_read_from_its_start() {
+    // One GOP: no I-picture follows any later sampling point.
+    let files = vec![("VIDEO_TS/VTS_01_1.VOB", vob(&[RED], 20_000, false))];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let path = &found.thumbnail.path;
+        assert!(path.ends_with("at 0%"), "{fs}: {path}");
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn a_title_that_is_dark_throughout_still_gives_a_frame() {
+    let files = vec![(
+        "VIDEO_TS/VTS_01_1.VOB",
+        vob(&[Look::Black; 10], 3000, false),
+    )];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let p = picture(&found);
+        // Nothing to frame: the black picture is kept whole.
+        assert_eq!((p.width, p.height), (W, H), "{fs}");
+    });
+}
+
+#[test]
+fn scrambled_titles_fall_back_to_the_menu() {
+    let files = vec![
+        ("VIDEO_TS/VIDEO_TS.VOB", vob(&[RED; 2], 1000, false)),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[BLUE; 10], 3000, true)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let path = &found.thumbnail.path;
+        assert!(path.contains("(menu)"), "{fs}: {path}");
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+
+    // Everything scrambled: no thumbnail.
+    let files = vec![
+        ("VIDEO_TS/VIDEO_TS.VOB", vob(&[RED; 2], 1000, true)),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[BLUE; 10], 3000, true)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        assert_eq!(result.err(), Some(Error::NotFound), "{fs}");
+    });
+}
+
+#[test]
+fn jacket_picture_comes_before_root_covers_and_frames() {
+    let jacket_cfg = WriterConfig::mpeg2();
+    let large = intra_picture(&jacket_cfg, W, H, |x, y| RED.color(x, y));
+    let small = intra_picture(&jacket_cfg, 96, 64, |x, y| BLUE.color(x, y));
+    let files = vec![
+        ("JACKET_P/J00___5S.MP2", small),
+        ("JACKET_P/J00___5L.MP2", large.clone()),
+        ("COVER.JPG", b"\xFF\xD8\xFF\xE0 not decoded here".to_vec()),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[BLUE; 6], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(found.thumbnail.path, "JACKET_P/J00___5L.MP2", "{fs}");
+        let p = picture(&found);
+        assert_eq!((p.width, p.height), (W, H), "{fs}");
+        assert!(is_red(p), "{fs}");
+    });
+
+    // A jacket wrapped in a program stream, and a broken large jacket: the
+    // medium one is used.
+    let medium = intra_picture(&jacket_cfg, 176, 112, |x, y| BLUE.color(x, y));
+    let files = vec![
+        ("JACKET_P/J00___5L.MP2", large[..large.len() / 3].to_vec()),
+        (
+            "JACKET_P/J00___5M.MP2",
+            mux(&medium, &PsOptions::default()).data,
+        ),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(found.thumbnail.path, "JACKET_P/J00___5M.MP2", "{fs}");
+        let p = picture(&found);
+        assert_eq!((p.width, p.height), (176, 112), "{fs}");
+        assert!(is_blue(p), "{fs}");
+    });
+}
+
+#[test]
+fn root_cover_comes_before_frames() {
+    let files = vec![
+        ("FOLDER.JPG", b"\xFF\xD8\xFF\xE0 cover".to_vec()),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[BLUE; 6], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let path = &found.thumbnail.path;
+        assert!(path.eq_ignore_ascii_case("FOLDER.JPG"), "{fs}: {path}");
+        assert!(
+            matches!(found.thumbnail.content, Content::Encoded(_)),
+            "{fs}"
+        );
+    });
+}
+
+#[test]
+fn blu_ray_artwork_comes_first() {
+    let jacket = intra_picture(&WriterConfig::mpeg2(), W, H, |x, y| RED.color(x, y));
+    let files = vec![
+        (
+            "BDMV/META/DL/DISC_640x360.JPG",
+            b"\xFF\xD8\xFF\xE0 bd".to_vec(),
+        ),
+        ("JACKET_P/J00___5L.MP2", jacket),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[BLUE; 6], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        let path = &found.thumbnail.path;
+        assert!(path.starts_with("BDMV/META/DL/"), "{fs}: {path}");
+    });
+}
+
+#[test]
+fn mpeg1_titles_work() {
+    let es = title_es(&[RED; 8], 2000, true);
+    let opts = PsOptions {
+        mpeg1: true,
+        end_code: false,
+        ..PsOptions::default()
+    };
+    let files = vec![("VIDEO_TS/VTS_01_1.VOB", mux(&es, &opts).data)];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn frame_search_reads_little() {
+    // A long title (about 60 MiB): the search reads a few MiB at most, in a
+    // few dozen requests, whatever the title length.
+    let looks: Vec<Look> = (0..400)
+        .map(|i| if i % 3 == 0 { Look::Black } else { BLUE })
+        .collect();
+    let files = vec![("VIDEO_TS/VTS_01_1.VOB", vob(&looks, 50_000, false))];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert!(
+            found.bytes_read <= 6 << 20,
+            "{fs}: {} bytes",
+            found.bytes_read
+        );
+        assert!(found.reads <= 64, "{fs}: {} reads", found.reads);
+    });
+}
+
+#[test]
+fn damaged_dvds_never_panic() {
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let base_vob = vob(&[BLUE, Look::Black, RED, BLUE], 2000, false);
+    let jacket = intra_picture(&WriterConfig::mpeg2(), 176, 112, |x, y| RED.color(x, y));
+    for round in 0..120 {
+        let mut v = base_vob.clone();
+        let mut j = jacket.clone();
+        for _ in 0..(1 + round % 16) {
+            let r = mpeg2_writer::xorshift(&mut seed) as usize;
+            let at = r % v.len();
+            v[at] = (r >> 32) as u8;
+            let at = (r >> 16) % j.len();
+            j[at] ^= (r >> 40) as u8;
+        }
+        if round % 7 == 0 {
+            let keep = mpeg2_writer::xorshift(&mut seed) as usize % v.len();
+            v.truncate(keep);
+        }
+        let files = vec![
+            ("JACKET_P/J00___5L.MP2", j),
+            ("VIDEO_TS/VIDEO_TS.VOB", v.clone()),
+            ("VIDEO_TS/VTS_01_1.VOB", v),
+        ];
+        // Any outcome is fine as long as there is one.
+        on_every_file_system(&files, |_, _| {});
     }
 }

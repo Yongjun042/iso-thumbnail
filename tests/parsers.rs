@@ -9,6 +9,7 @@ extern crate IsoPreview as iso_preview;
 use std::io::Cursor;
 
 use iso_preview::error::Error;
+use iso_preview::finder::{Content, Thumbnail};
 use iso_preview::fs::FileSystem;
 use iso_preview::iso9660::Iso9660;
 use iso_preview::reader::{ByteSource, CachedReader, SeekSource};
@@ -19,6 +20,14 @@ const SECTOR: usize = 2048;
 const JPEG_BIG: &[u8] = b"\xFF\xD8\xFF\xE0 big 640x360 cover bytes";
 const JPEG_SMALL: &[u8] = b"\xFF\xD8\xFF\xE0 small";
 const XML: &[u8] = b"<disclib/>";
+
+/// The bytes of an encoded picture file thumbnail (all thumbnails here are).
+fn encoded(thumbnail: &Thumbnail) -> &[u8] {
+    match &thumbnail.content {
+        Content::Encoded(data) => data,
+        Content::Picture(_) => panic!("{}: decoded picture, expected a file", thumbnail.path),
+    }
+}
 
 fn extract(image: &[u8]) -> Result<Extracted, Error> {
     iso_preview::extract_thumbnail(SeekSource(Cursor::new(image.to_vec())))
@@ -342,7 +351,7 @@ fn assert_big_cover(found: &Extracted, filesystem: &str) {
         "picked {}",
         found.thumbnail.path
     );
-    assert_eq!(found.thumbnail.data, JPEG_BIG);
+    assert_eq!(encoded(&found.thumbnail), JPEG_BIG);
 }
 
 #[test]
@@ -383,7 +392,7 @@ fn udf_without_artwork_reports_not_found() {
 fn oversized_artwork_is_skipped_for_the_next_candidate() {
     let found = extract(&build_udf(true, true, Some(17 << 20))).unwrap();
     assert!(found.thumbnail.path.ends_with("COVER_416x240.jpg"));
-    assert_eq!(found.thumbnail.data, JPEG_SMALL);
+    assert_eq!(encoded(&found.thumbnail), JPEG_SMALL);
 }
 
 #[test]
@@ -474,7 +483,7 @@ fn broken_root_cover_does_not_hide_the_next_one() {
     img.put(19, 0, JPEG_BIG);
     let found = extract(&img.data).unwrap();
     assert_eq!(found.thumbnail.path, "POSTER.JPG");
-    assert_eq!(found.thumbnail.data, JPEG_BIG);
+    assert_eq!(encoded(&found.thumbnail), JPEG_BIG);
 }
 
 #[test]

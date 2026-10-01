@@ -183,8 +183,8 @@ function Invoke-Ffmpeg {
 }
 
 function New-DvdVob {
-    # A DVD-compliant program stream made of lavfi sections (@(source, seconds)),
-    # optionally letterboxed: a 16:9 picture with black bars inside the 4:3 frame.
+    # A DVD-compliant program stream made of lavfi sections (@(source, seconds[,
+    # extra filters])), optionally letterboxed: a 16:9 picture with black bars inside the 4:3 frame.
     param([string] $Out, [string] $Target, [string] $Aspect, [object[]] $Sections, [switch] $Letterbox)
     $pal = $Target -like 'pal*'
     $size = if ($pal) { '720x576' } else { '720x480' }
@@ -203,7 +203,8 @@ function New-DvdVob {
         if ($Letterbox) {
             $box = if ($pal) { ',scale=720:432,pad=720:576:0:72:black' } else { ',scale=720:360,pad=720:480:0:60:black' }
         }
-        $chains += "[${i}:v]format=yuv420p$box,setsar=1[v$i]"
+        $extra = if ($Sections[$i].Count -gt 2) { ',' + $Sections[$i][2] } else { '' }
+        $chains += "[${i}:v]format=yuv420p$extra$box,setsar=1[v$i]"
         $labels += "[v$i]"
     }
     $audio = $Sections.Count
@@ -250,11 +251,13 @@ function New-DvdTree {
     New-Item -ItemType Directory -Path (Join-Path $Root 'AUDIO_TS') | Out-Null
     foreach ($n in @('VIDEO_TS.IFO', 'VIDEO_TS.BUP')) { New-IfoStub (Join-Path $vts $n) 'VMG' }
     foreach ($n in @('VTS_01_0.IFO', 'VTS_01_0.BUP', 'VTS_02_0.IFO', 'VTS_02_0.BUP')) { New-IfoStub (Join-Path $vts $n) 'VTS' }
-    # Menu; main title (bright, then black around the first sampling point at
-    # 25 %, then bright again) split in two parts; a short second title.
+    # Menu; main title split in two parts; a short second title. The main title
+    # is bright, then near-black around the first sampling point (25 % of its
+    # bytes: the faint noise keeps the dark part from compressing to nothing),
+    # then bright again.
     New-DvdVob (Join-Path $vts 'VIDEO_TS.VOB') $Target $Aspect @(, @('smptebars', 2))
     $main = Join-Path $vts 'main.vob'
-    New-DvdVob $main $Target $Aspect @(@('mandelbrot', 3), @('color=c=black', 4), @('testsrc2', 13)) -Letterbox:$Letterbox
+    New-DvdVob $main $Target $Aspect @(@('mandelbrot', 3), @('color=c=black', 3, 'noise=alls=10:allf=t'), @('testsrc2', 13)) -Letterbox:$Letterbox
     Split-Vob $main (Join-Path $vts 'VTS_01_1.VOB') (Join-Path $vts 'VTS_01_2.VOB')
     New-DvdVob (Join-Path $vts 'VTS_02_1.VOB') $Target $Aspect @(, @('rgbtestsrc', 4))
     if ($Jacket) {
