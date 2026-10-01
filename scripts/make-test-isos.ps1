@@ -1,11 +1,16 @@
 <#
 .SYNOPSIS
-  Builds a set of small .iso test images that mimic Blu-ray disc layouts.
+  Builds a set of small .iso test images that mimic Blu-ray and DVD-Video disc layouts.
 
 .DESCRIPTION
   Uses the IMAPI2 file-system image API that ships with Windows (no admin
   rights needed) to write UDF 1.02 / 2.01 / 2.50, ISO 9660 and Joliet images.
   The generated JPEG/PNG artwork is drawn with System.Drawing.
+
+  When ffmpeg is on PATH, DVD-Video images are built too: real MPEG-2 program
+  streams from ffmpeg's DVD muxer (VIDEO_TS with a main title split into two
+  VOBs, a shorter second title set and a menu), a jacket picture variant and a
+  PAL 16:9 variant. Without ffmpeg the DVD images are skipped with a warning.
 
 .PARAMETER OutDir
   Directory that receives the .iso files (created if missing).
@@ -159,3 +164,118 @@ New-TestImage (Join-Path $OutDir 'bd_tn_udf250.iso')    $treeTn    4 0x250 'BD_T
 New-TestImage (Join-Path $OutDir 'bd_nothumb_udf250.iso') $treeNone 4 0x250 'BD_NOTHUMB'
 New-TestImage (Join-Path $OutDir 'rootcover_udf250.iso') $treeRoot 4 0x250 'ROOT_COVER'
 New-TestImage (Join-Path $OutDir 'rootcover_joliet.iso') $treeRoot 3 0     'ROOT_COVER_J'
+
+# ---------------------------------------------------------------------------
+# DVD-Video images (need ffmpeg)
+# ---------------------------------------------------------------------------
+
+$ffmpeg = (Get-Command ffmpeg -ErrorAction SilentlyContinue)
+if (-not $ffmpeg) {
+    Write-Warning 'ffmpeg is not on PATH: DVD-Video test images skipped.'
+    return
+}
+$ffmpeg = $ffmpeg.Source
+
+function Invoke-Ffmpeg {
+    param([string[]] $Arguments)
+    & $ffmpeg -hide_banner -loglevel error -nostdin -y @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "ffmpeg failed: $($Arguments -join ' ')" }
+}
+
+function New-DvdVob {
+    # A DVD-compliant program stream made of lavfi sections (@(source, seconds)),
+    # optionally letterboxed: a 16:9 picture with black bars inside the 4:3 frame.
+    param([string] $Out, [string] $Target, [string] $Aspect, [object[]] $Sections, [switch] $Letterbox)
+    $pal = $Target -like 'pal*'
+    $size = if ($pal) { '720x576' } else { '720x480' }
+    $rate = if ($pal) { '25' } else { '30000/1001' }
+    $inputs = @()
+    $chains = @()
+    $labels = ''
+    $total = 0
+    for ($i = 0; $i -lt $Sections.Count; $i++) {
+        $source = $Sections[$i][0]
+        $seconds = $Sections[$i][1]
+        $total += $seconds
+        $sep = if ($source.Contains('=')) { ':' } else { '=' }
+        $inputs += @('-f', 'lavfi', '-t', "$seconds", '-i', "${source}${sep}s=${size}:r=$rate")
+        $box = ''
+        if ($Letterbox) {
+            $box = if ($pal) { ',scale=720:432,pad=720:576:0:72:black' } else { ',scale=720:360,pad=720:480:0:60:black' }
+        }
+        $chains += "[${i}:v]format=yuv420p$box,setsar=1[v$i]"
+        $labels += "[v$i]"
+    }
+    $audio = $Sections.Count
+    $inputs += @('-f', 'lavfi', '-t', "$total", '-i', 'sine=frequency=440:sample_rate=48000')
+    $graph = ($chains -join ';') + ";${labels}concat=n=$($Sections.Count):v=1:a=0[v]"
+    Invoke-Ffmpeg ($inputs + @('-filter_complex', $graph, '-map', '[v]', '-map', "${audio}:a",
+        '-target', $Target, '-aspect', $Aspect, $Out))
+}
+
+function Split-Vob {
+    # Splits a VOB into two parts at a pack (2048-byte) boundary near the middle,
+    # like the 1 GiB parts of a real title.
+    param([string] $Path, [string] $First, [string] $Second)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $cut = [int]([Math]::Floor($bytes.Length / 2 / 2048) * 2048)
+    [System.IO.File]::WriteAllBytes($First, $bytes[0..($cut - 1)])
+    [System.IO.File]::WriteAllBytes($Second, $bytes[$cut..($bytes.Length - 1)])
+    Remove-Item $Path
+}
+
+function New-IfoStub {
+    # Placeholder IFO/BUP files: the handler does not read them.
+    param([string] $Path, [string] $Kind)
+    $b = New-Object byte[] 2048
+    $id = [System.Text.Encoding]::ASCII.GetBytes("DVDVIDEO-$Kind")
+    [Array]::Copy($id, $b, $id.Length)
+    [System.IO.File]::WriteAllBytes($Path, $b)
+}
+
+function New-JacketPicture {
+    # A jacket picture: one MPEG-2 I-picture as an elementary stream.
+    param([string] $Out, [string] $Size)
+    $photo = Join-Path $env:WINDIR 'Web\4K\Wallpaper\Windows\img0_1920x1200.jpg'
+    $source = if (Test-Path $photo) { @('-i', $photo) } else { @('-f', 'lavfi', '-i', 'testsrc2=s=1280x720') }
+    Invoke-Ffmpeg ($source + @('-vf', "scale=$Size,format=yuv420p", '-frames:v', '1', '-c:v', 'mpeg2video',
+        '-q:v', '2', '-aspect', '4:3', '-f', 'mpeg2video', $Out))
+}
+
+function New-DvdTree {
+    param([string] $Root, [string] $Target = 'ntsc-dvd', [string] $Aspect = '4:3', [switch] $Letterbox, [switch] $Jacket)
+    if (Test-Path $Root) { Remove-Item -Recurse -Force $Root }
+    $vts = Join-Path $Root 'VIDEO_TS'
+    New-Item -ItemType Directory -Path $vts | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $Root 'AUDIO_TS') | Out-Null
+    foreach ($n in @('VIDEO_TS.IFO', 'VIDEO_TS.BUP')) { New-IfoStub (Join-Path $vts $n) 'VMG' }
+    foreach ($n in @('VTS_01_0.IFO', 'VTS_01_0.BUP', 'VTS_02_0.IFO', 'VTS_02_0.BUP')) { New-IfoStub (Join-Path $vts $n) 'VTS' }
+    # Menu; main title (bright, then black around the first sampling point at
+    # 25 %, then bright again) split in two parts; a short second title.
+    New-DvdVob (Join-Path $vts 'VIDEO_TS.VOB') $Target $Aspect @(, @('smptebars', 2))
+    $main = Join-Path $vts 'main.vob'
+    New-DvdVob $main $Target $Aspect @(@('mandelbrot', 3), @('color=c=black', 4), @('testsrc2', 13)) -Letterbox:$Letterbox
+    Split-Vob $main (Join-Path $vts 'VTS_01_1.VOB') (Join-Path $vts 'VTS_01_2.VOB')
+    New-DvdVob (Join-Path $vts 'VTS_02_1.VOB') $Target $Aspect @(, @('rgbtestsrc', 4))
+    if ($Jacket) {
+        $jp = Join-Path $Root 'JACKET_P'
+        New-Item -ItemType Directory -Path $jp | Out-Null
+        New-JacketPicture (Join-Path $jp 'J00___5L.MP2') '720:480'
+        New-JacketPicture (Join-Path $jp 'J00___5M.MP2') '176:112'
+        New-JacketPicture (Join-Path $jp 'J00___5S.MP2') '96:64'
+    }
+}
+
+$dvdNtsc = Join-Path $work 'dvd_ntsc'
+$dvdJacket = Join-Path $work 'dvd_jacket'
+$dvdPal = Join-Path $work 'dvd_pal'
+New-DvdTree -Root $dvdNtsc -Letterbox
+New-DvdTree -Root $dvdJacket -Jacket
+New-DvdTree -Root $dvdPal -Target 'pal-dvd' -Aspect '16:9'
+
+# DVD-Video discs carry UDF 1.02 and ISO 9660 side by side (FileSystemsToCreate 5).
+New-TestImage (Join-Path $OutDir 'dvd_bridge.iso')  $dvdNtsc   5 0x102 'DVD_BRIDGE'
+New-TestImage (Join-Path $OutDir 'dvd_udf102.iso')  $dvdNtsc   4 0x102 'DVD_UDF102'
+New-TestImage (Join-Path $OutDir 'dvd_iso9660.iso') $dvdNtsc   1 0     'DVD_ISO9660'
+New-TestImage (Join-Path $OutDir 'dvd_jacket.iso')  $dvdJacket 5 0x102 'DVD_JACKET'
+New-TestImage (Join-Path $OutDir 'dvd_pal169.iso')  $dvdPal    5 0x102 'DVD_PAL169'

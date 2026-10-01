@@ -29,17 +29,20 @@ const PACK: u64 = 2048;
 /// Bytes requested from the image per read while scanning a VOB.
 const READ_CHUNK: usize = 256 << 10;
 /// Most bytes scanned from one sampling position before giving up on it. A
-/// VOBU (which starts with an I-frame) is at most about 1.2 MiB at the
-/// highest DVD bit rate, so this always reaches the next I-frame.
-const MAX_SCAN_BYTES: u64 = 3 << 20;
+/// VOBU (which starts with an I-frame) lasts at most about a second, about
+/// 1.3 MB at DVD's highest mux rate, so this always reaches the next
+/// I-frame and the end of that picture.
+const MAX_SCAN_BYTES: u64 = 2 << 20;
 /// Most elementary stream bytes buffered while waiting for an I-picture to
 /// complete. DVD I-pictures are well below 1 MiB.
 const MAX_ES_BYTES: usize = 2 << 20;
 /// Positions sampled in the main title, in per mille of its size, in the
-/// order tried. The beginning of a film is often logos and titles.
-const SAMPLE_PERMILLE: [u64; 5] = [250, 400, 150, 550, 700];
-/// Most frames decoded per disc (titles and menus together).
-const MAX_ATTEMPTS: usize = 6;
+/// order tried. The beginning of a film is often logos and titles, so it
+/// comes last: a title shorter than a few VOBUs has its only sequence
+/// headers there.
+const SAMPLE_PERMILLE: [u64; 6] = [250, 400, 150, 550, 700, 0];
+/// Most sampling attempts per disc (titles and menus together).
+const MAX_ATTEMPTS: usize = 8;
 /// Title sets tried, largest first, when the largest yields nothing.
 const MAX_TITLE_SETS: usize = 2;
 /// Menu VOBs tried when no title frame was found.
