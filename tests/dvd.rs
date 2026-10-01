@@ -697,44 +697,123 @@ fn partly_scrambled_titles_give_no_frame() {
 // Menus described by IFO files
 // ----------------------------------------------------------------------------
 
-/// An IFO file (`kind` "VMG" or "VTS") whose menu PGCI unit table holds one
-/// language unit with an entry PGC per `(menu id, first VOBU, last VOBU)`,
-/// each with one cell. Menu ids: 2 title, 3 root, 5 audio.
-fn menu_ifo(kind: &str, menus: &[(u8, u32, u32)]) -> Vec<u8> {
+/// One menu PGC for `menu_ifo_units`.
+struct TestPgc {
+    /// Bit 7: entry PGC; low nibble: menu type (2 title, 3 root, 5 audio).
+    category: u8,
+    /// (first VOBU, last VOBU) sectors of each cell.
+    cells: Vec<(u32, u32)>,
+    /// Pre-commands, 8 bytes each.
+    pre: Vec<[u8; 8]>,
+}
+
+/// `LinkPGCN n` (n is 1-based).
+fn link_pgcn(n: u16) -> [u8; 8] {
+    [0x20, 0x04, 0, 0, 0, 0, (n >> 8) as u8 & 0x7F, n as u8]
+}
+
+/// `JumpSS VTSM` to the root menu of title set `vts`.
+fn jump_title_set_root(vts: u8) -> [u8; 8] {
+    [0x30, 0x06, 0, 0, vts & 0x7F, 0x80 | 3, 0, 0]
+}
+
+/// A PGC laid out like an authored one: the 0xEC-byte header, then the
+/// command table, the program map, the cell playback table and the cell
+/// position table, each found through its offset in the header.
+fn test_pgc_bytes(pgc: &TestPgc) -> Vec<u8> {
+    let mut p = vec![0u8; 0xEC];
+    p[2] = u8::from(!pgc.cells.is_empty());
+    p[3] = pgc.cells.len() as u8;
+    let commands = p.len();
+    let mut table = vec![0u8; 8];
+    table[0..2].copy_from_slice(&(pgc.pre.len() as u16).to_be_bytes());
+    for c in &pgc.pre {
+        table.extend_from_slice(c);
+    }
+    let last = (table.len() - 1) as u16;
+    table[6..8].copy_from_slice(&last.to_be_bytes());
+    p.extend(table);
+    let program_map = p.len();
+    p.extend_from_slice(&[1, 0]);
+    let cell_table = p.len();
+    for &(first, last) in &pgc.cells {
+        let mut c = [0u8; 24];
+        c[8..12].copy_from_slice(&first.to_be_bytes());
+        c[16..20].copy_from_slice(&last.to_be_bytes());
+        c[20..24].copy_from_slice(&last.to_be_bytes());
+        p.extend_from_slice(&c);
+    }
+    let cell_positions = p.len();
+    for i in 0..pgc.cells.len() {
+        p.extend_from_slice(&[0, 1, 0, i as u8 + 1]);
+    }
+    p[0xE4..0xE6].copy_from_slice(&(commands as u16).to_be_bytes());
+    if !pgc.cells.is_empty() {
+        p[0xE6..0xE8].copy_from_slice(&(program_map as u16).to_be_bytes());
+        p[0xE8..0xEA].copy_from_slice(&(cell_table as u16).to_be_bytes());
+        p[0xEA..0xEC].copy_from_slice(&(cell_positions as u16).to_be_bytes());
+    }
+    p
+}
+
+/// An IFO file (`kind` "VMG" or "VTS") with a menu PGCI unit table of the
+/// given language units, laid out as libdvdread reads it.
+fn menu_ifo_units(kind: &str, units: &[Vec<TestPgc>]) -> Vec<u8> {
     let mut header = ifo(kind);
+    // The menu VOBS start sector (unused by the handler, non-zero on discs
+    // with menus) and the sector of the menu PGCI unit table.
+    header[0xC0..0xC4].copy_from_slice(&4u32.to_be_bytes());
     let pointer = if kind == "VMG" { 0xC8 } else { 0xD0 };
     header[pointer..pointer + 4].copy_from_slice(&1u32.to_be_bytes());
-    // One PGC per menu: 0xEC bytes of PGC fields, then one 24-byte cell.
-    let pgc_len = 0xEC + 24;
-    let unit_head = 8 + 8 * menus.len();
-    let mut unit = vec![0u8; unit_head];
-    unit[0..2].copy_from_slice(&(menus.len() as u16).to_be_bytes());
-    for (n, &(id, _, _)) in menus.iter().enumerate() {
-        unit[8 + n * 8] = 0x80 | id;
-        let at = (unit_head + n * pgc_len) as u32;
-        unit[8 + n * 8 + 4..8 + n * 8 + 8].copy_from_slice(&at.to_be_bytes());
+    let mut unit_blobs = Vec::new();
+    for pgcs in units {
+        let blobs: Vec<Vec<u8>> = pgcs.iter().map(test_pgc_bytes).collect();
+        let mut unit = vec![0u8; 8 + 8 * pgcs.len()];
+        unit[0..2].copy_from_slice(&(pgcs.len() as u16).to_be_bytes());
+        let mut at = unit.len();
+        for (n, (pgc, blob)) in pgcs.iter().zip(&blobs).enumerate() {
+            unit[8 + n * 8] = pgc.category;
+            unit[8 + n * 8 + 4..8 + n * 8 + 8].copy_from_slice(&(at as u32).to_be_bytes());
+            at += blob.len();
+        }
+        for blob in blobs {
+            unit.extend(blob);
+        }
+        let last = (unit.len() - 1) as u32;
+        unit[4..8].copy_from_slice(&last.to_be_bytes());
+        unit_blobs.push(unit);
     }
-    for &(_, first, last) in menus {
-        let mut pgc = vec![0u8; pgc_len];
-        pgc[2] = 1; // programs
-        pgc[3] = 1; // cells
-        pgc[0xE8..0xEA].copy_from_slice(&0xECu16.to_be_bytes());
-        pgc[0xEC + 8..0xEC + 12].copy_from_slice(&first.to_be_bytes());
-        pgc[0xEC + 16..0xEC + 20].copy_from_slice(&last.to_be_bytes());
-        unit.extend(pgc);
+    let mut table = vec![0u8; 8 + 8 * units.len()];
+    table[0..2].copy_from_slice(&(units.len() as u16).to_be_bytes());
+    let mut at = table.len();
+    for (n, blob) in unit_blobs.iter().enumerate() {
+        table[8 + n * 8..8 + n * 8 + 2].copy_from_slice(b"en");
+        // Menu existence flags: title menu (VMG) or root menu (VTS).
+        table[8 + n * 8 + 3] = 0x80;
+        table[8 + n * 8 + 4..8 + n * 8 + 8].copy_from_slice(&(at as u32).to_be_bytes());
+        at += blob.len();
     }
-    let unit_last = (unit.len() - 1) as u32;
-    unit[4..8].copy_from_slice(&unit_last.to_be_bytes());
-    let mut table = vec![0u8; 16];
-    table[0..2].copy_from_slice(&1u16.to_be_bytes());
-    table[8..10].copy_from_slice(b"en");
-    table[11] = 0x80;
-    table[12..16].copy_from_slice(&16u32.to_be_bytes());
-    table.extend(unit);
+    for blob in unit_blobs {
+        table.extend(blob);
+    }
     let table_last = (table.len() - 1) as u32;
     table[4..8].copy_from_slice(&table_last.to_be_bytes());
     header.extend(table);
     header
+}
+
+/// An IFO file whose single language unit has one entry PGC with one cell per
+/// `(menu id, first VOBU, last VOBU)`. Menu ids: 2 title, 3 root, 5 audio.
+fn menu_ifo(kind: &str, menus: &[(u8, u32, u32)]) -> Vec<u8> {
+    let pgcs = menus
+        .iter()
+        .map(|&(id, first, last)| TestPgc {
+            category: 0x80 | id,
+            cells: vec![(first, last)],
+            pre: Vec::new(),
+        })
+        .collect();
+    menu_ifo_units(kind, &[pgcs])
 }
 
 /// Concatenates VOBs (each a whole number of packs) and returns the result
@@ -1078,6 +1157,247 @@ fn a_dark_title_gives_way_to_a_menu_without_ifo() {
             found.thumbnail.path.contains("(menu)"),
             "{fs}: {}",
             found.thumbnail.path
+        );
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+// ----------------------------------------------------------------------------
+// Authored menu structures
+// ----------------------------------------------------------------------------
+
+#[test]
+fn a_router_root_menu_is_followed() {
+    // The entry root PGC has no cells: its pre-commands link (after a
+    // dangling link) to PGC 3, a non-entry PGC that shows the menu.
+    let (menu_vob, starts) = concat(&[vob(&[BLUE; 2], 500, false), vob(&[RED; 2], 500, false)]);
+    let ifo_bytes = menu_ifo_units(
+        "VTS",
+        &[vec![
+            TestPgc {
+                category: 0x83,
+                cells: Vec::new(),
+                pre: vec![link_pgcn(9), link_pgcn(3)],
+            },
+            TestPgc {
+                category: 0x85,
+                cells: vec![(starts[0], starts[0])],
+                pre: Vec::new(),
+            },
+            TestPgc {
+                category: 0x03,
+                cells: vec![(starts[1], starts[1])],
+                pre: Vec::new(),
+            },
+        ]],
+    );
+    let files = vec![
+        ("VIDEO_TS/VTS_01_0.IFO", ifo_bytes),
+        ("VIDEO_TS/VTS_01_0.VOB", menu_vob),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[GREEN; 8], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(
+            found.thumbnail.path, "VIDEO_TS/VTS_01_0.VOB (root menu)",
+            "{fs}"
+        );
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn the_title_menu_leads_to_the_root_menu_of_another_title_set() {
+    // The film (VTS_02) has no menus; the main menu is the root menu of the
+    // small VTS_01, which the title menu jumps to.
+    let vmg = menu_ifo_units(
+        "VMG",
+        &[vec![TestPgc {
+            category: 0x82,
+            cells: Vec::new(),
+            pre: vec![jump_title_set_root(1)],
+        }]],
+    );
+    let (menu_vob, starts) = concat(&[vob(&[BLUE; 2], 500, false), vob(&[RED; 2], 500, false)]);
+    let files = vec![
+        ("VIDEO_TS/VIDEO_TS.IFO", vmg),
+        ("VIDEO_TS/VIDEO_TS.VOB", vob(&[Look::Flat; 2], 500, false)),
+        (
+            "VIDEO_TS/VTS_01_0.IFO",
+            menu_ifo("VTS", &[(3, starts[1], starts[1])]),
+        ),
+        ("VIDEO_TS/VTS_01_0.VOB", menu_vob),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[BLUE; 2], 500, false)),
+        ("VIDEO_TS/VTS_02_0.IFO", ifo("VTS")),
+        ("VIDEO_TS/VTS_02_1.VOB", vob(&[GREEN; 10], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(
+            found.thumbnail.path, "VIDEO_TS/VTS_01_0.VOB (root menu)",
+            "{fs}"
+        );
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn a_menu_that_opens_with_an_intro_cell_is_seen_in_its_loop() {
+    // Cell 1: a black intro; cell 2: the menu loop.
+    let (menu_vob, starts) = concat(&[
+        vob(&[Look::Black; 2], 500, false),
+        vob(&[RED; 2], 500, false),
+    ]);
+    let ifo_bytes = menu_ifo_units(
+        "VTS",
+        &[vec![TestPgc {
+            category: 0x83,
+            cells: vec![(starts[0], starts[0]), (starts[1], starts[1])],
+            pre: Vec::new(),
+        }]],
+    );
+    let files = vec![
+        ("VIDEO_TS/VTS_01_0.IFO", ifo_bytes),
+        ("VIDEO_TS/VTS_01_0.VOB", menu_vob),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[GREEN; 8], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(
+            found.thumbnail.path, "VIDEO_TS/VTS_01_0.VOB (root menu)",
+            "{fs}"
+        );
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn a_located_dark_menu_is_not_replaced_by_a_warning() {
+    // A dark but detailed root menu, scrambled titles, and a VIDEO_TS.VOB
+    // that opens with a bright warning: the located menu stays.
+    let dim = Look::Checker(128, 128);
+    let dim_es = {
+        let c = cfg(false);
+        let mut es = Vec::new();
+        for _ in 0..2 {
+            es.extend(intra_picture(&c, W, H, |x, y| {
+                let (_, cb, cr) = dim.color(x, y);
+                (if (x + y) % 2 == 0 { 17 } else { 39 }, cb, cr)
+            }));
+            es.extend(predicted_picture(&c, 2));
+        }
+        es
+    };
+    let menu_vob = plain_vob(&dim_es);
+    let files = vec![
+        ("VIDEO_TS/VIDEO_TS.VOB", vob(&[BLUE; 2], 500, false)),
+        ("VIDEO_TS/VTS_01_0.IFO", menu_ifo("VTS", &[(3, 0, 0)])),
+        ("VIDEO_TS/VTS_01_0.VOB", menu_vob),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[GREEN; 8], 3000, true)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(
+            found.thumbnail.path, "VIDEO_TS/VTS_01_0.VOB (root menu)",
+            "{fs}"
+        );
+    });
+}
+
+#[test]
+fn a_menu_cell_outside_the_vob_tries_the_next_language_unit() {
+    let (menu_vob, starts) = concat(&[vob(&[BLUE; 2], 500, false), vob(&[RED; 2], 500, false)]);
+    let root = |first: u32| TestPgc {
+        category: 0x83,
+        cells: vec![(first, first)],
+        pre: Vec::new(),
+    };
+    let ifo_bytes = menu_ifo_units("VTS", &[vec![root(999_999)], vec![root(starts[1])]]);
+    let files = vec![
+        ("VIDEO_TS/VTS_01_0.IFO", ifo_bytes),
+        ("VIDEO_TS/VTS_01_0.VOB", menu_vob),
+        ("VIDEO_TS/VTS_01_1.VOB", vob(&[GREEN; 8], 3000, false)),
+    ];
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(
+            found.thumbnail.path, "VIDEO_TS/VTS_01_0.VOB (root menu)",
+            "{fs}"
+        );
+        assert!(is_red(picture(&found)), "{fs}");
+    });
+}
+
+#[test]
+fn unreadable_title_data_does_not_count_as_searched() {
+    use iso_preview::finder::find_thumbnail;
+    // The title VOB's File Entry is intact (its size reads fine) but its
+    // allocation descriptor points far outside the image.
+    let title = vob(&[RED; 4], 3000, false);
+    let files: [(&str, &[u8]); 1] = [("VIDEO_TS/VTS_01_1.VOB", &title)];
+    let mut image = udf102(&files, UdfOptions::default());
+    let fe = image
+        .chunks_exact(SECTOR)
+        .position(|s| {
+            s[0..2] == 261u16.to_le_bytes() && s[56..64] == (title.len() as u64).to_le_bytes()
+        })
+        .expect("file entry of the title VOB");
+    let ad = fe * SECTOR + 176 + 4;
+    image[ad..ad + 4].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+    let mut rd = reader(image);
+    let mut fs = Udf::open(&mut rd).unwrap();
+    let mut searched = false;
+    assert_eq!(
+        find_thumbnail(&mut fs, &mut searched).err(),
+        Some(Error::NotFound)
+    );
+    assert!(!searched);
+}
+
+#[test]
+fn the_title_menu_jump_is_followed_before_other_title_sets() {
+    // Title sets 1, 3, 4 and 5 have menu VOBs without a root menu and larger
+    // titles than set 6, whose root menu the title menu jumps to. Only
+    // following the jump reaches it within the menu lookup limit.
+    let vmg = menu_ifo_units(
+        "VMG",
+        &[vec![TestPgc {
+            category: 0x82,
+            cells: Vec::new(),
+            pre: vec![jump_title_set_root(6)],
+        }]],
+    );
+    let (menu_vob, starts) = concat(&[vob(&[BLUE; 2], 300, false), vob(&[RED; 2], 300, false)]);
+    let mut owned: Vec<(String, Vec<u8>)> = vec![
+        ("VIDEO_TS/VIDEO_TS.IFO".into(), vmg),
+        (
+            "VIDEO_TS/VTS_02_1.VOB".into(),
+            vob(&[GREEN; 12], 3000, false),
+        ),
+        (
+            "VIDEO_TS/VTS_06_0.IFO".into(),
+            menu_ifo("VTS", &[(3, starts[1], starts[1])]),
+        ),
+        ("VIDEO_TS/VTS_06_0.VOB".into(), menu_vob),
+        ("VIDEO_TS/VTS_06_1.VOB".into(), vob(&[BLUE], 300, false)),
+    ];
+    for set in [1, 3, 4, 5] {
+        owned.push((format!("VIDEO_TS/VTS_{set:02}_0.IFO"), ifo("VTS")));
+        owned.push((
+            format!("VIDEO_TS/VTS_{set:02}_0.VOB"),
+            vob(&[BLUE], 300, false),
+        ));
+        owned.push((
+            format!("VIDEO_TS/VTS_{set:02}_1.VOB"),
+            vob(&[BLUE; 3], 1000, false),
+        ));
+    }
+    let files: Vec<(&str, Vec<u8>)> = owned.iter().map(|(p, d)| (p.as_str(), d.clone())).collect();
+    on_every_file_system(&files, |fs, result| {
+        let found = result.unwrap_or_else(|e| panic!("{fs}: {e}"));
+        assert_eq!(
+            found.thumbnail.path, "VIDEO_TS/VTS_06_0.VOB (root menu)",
+            "{fs}"
         );
         assert!(is_red(picture(&found)), "{fs}");
     });

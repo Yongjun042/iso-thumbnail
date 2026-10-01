@@ -6,17 +6,20 @@
 //!    MPEG-2 still picture authored for players' disc browsers. Mostly found on
 //!    Japanese discs. The finder prefers it over everything but Blu-ray artwork
 //!    (`jacket_picture`); the rest is `video_picture`.
-//! 2. The disc's menus as its IFO files describe them (see `crate::ifo`): the
-//!    root menu (main menu) of the main title set, then the video manager's
-//!    title menu. Each is looked at where its first cell starts and, for a
-//!    motion menu whose opening animation starts dark, where the cell's last
-//!    VOBU starts.
+//! 2. The disc's menus as its IFO files describe them (see `crate::ifo`, which
+//!    follows router PGCs and the title menu's jump to a title set): the root
+//!    menu (main menu) of the main title set, the video manager's title menu
+//!    or the root menu it jumps to, then the root menus of the other title
+//!    sets. Each is looked at where its first cell starts, where its last cell
+//!    starts (the loop after an intro cell) and where the first cell's last
+//!    VOBU starts (a motion menu's opening animation has settled there).
 //! 3. An I-frame of the main title, taken as the title set (`VTS_nn_1..9.VOB`)
 //!    holding the most data, when no menu gave a presentable picture. A few
 //!    positions are sampled.
 //! 4. The first picture of the menu VOBs (`VIDEO_TS.VOB`, `VTS_nn_0.VOB`)
-//!    without IFO information: the last resort, since a video manager VOB often
-//!    starts with a warning or a studio logo.
+//!    without IFO information: the last resort, only when no menu could be
+//!    located and decoded through the IFO files, since a video manager VOB
+//!    often starts with a warning or a studio logo.
 //!
 //! Throughout, frames that are nearly black, washed out or flat (fades, logos,
 //! title cards) are passed over unless nothing better turns up, and black
@@ -53,11 +56,14 @@ const MAX_SCAN_BYTES: u64 = 2 << 20;
 /// Most bytes scanned from a menu position the IFO gave: the I-picture starts
 /// right there, after the VOBU's navigation pack.
 const MENU_SCAN_BYTES: u64 = 1 << 20;
-/// Most attempts at the menus the IFO files describe (two menus, two
-/// positions each).
-const MAX_AUTHORED_MENU_ATTEMPTS: usize = 4;
+/// Most menus looked up through the IFO files (root menus of title sets and
+/// the title menu).
+const MAX_AUTHORED_MENUS: usize = 4;
+/// Most attempts at the menus the IFO files describe (up to three positions
+/// per menu).
+const MAX_AUTHORED_MENU_ATTEMPTS: usize = 6;
 /// Most `decode_intra` calls for all those attempts.
-const AUTHORED_MENU_DECODES: usize = 8;
+const AUTHORED_MENU_DECODES: usize = MAX_AUTHORED_MENU_ATTEMPTS * 2;
 /// Most elementary stream bytes buffered while waiting for an I-picture to
 /// complete. DVD I-pictures are well below 1 MiB.
 const MAX_ES_BYTES: usize = 2 << 20;
@@ -309,8 +315,21 @@ enum Grab {
     /// The video packets are scrambled (CSS).
     Scrambled,
     /// No complete, decodable I-picture within the scan and decode limits, or
-    /// a read failed (for instance because the image's read budget is used up).
-    Nothing,
+    /// a read failed (for instance because the image's read budget is used
+    /// up). `saw_video`: video packets were demultiplexed all the same.
+    Nothing {
+        saw_video: bool,
+    },
+}
+
+impl Grab {
+    /// Whether video packets (clear or scrambled) were read.
+    fn saw_video(&self) -> bool {
+        match self {
+            Grab::Frame(_) | Grab::Scrambled => true,
+            Grab::Nothing { saw_video } => *saw_video,
+        }
+    }
 }
 
 /// Demultiplexes from byte `start` of `parts` until the first I-picture that
@@ -400,7 +419,9 @@ fn grab_frame<F: FileSystem>(
     if demux.video_packets == 0 && demux.scrambled_packets > 0 {
         Grab::Scrambled
     } else {
-        Grab::Nothing
+        Grab::Nothing {
+            saw_video: demux.video_packets > 0,
+        }
     }
 }
 
@@ -528,26 +549,100 @@ fn title_sets<F: FileSystem>(fs: &mut F, video_ts: &F::Node) -> Vec<TitleSet<F::
     sets
 }
 
-/// Where the IFO (or its backup) of title set `ts` says `menu` starts.
-fn menu_cell<F: FileSystem>(
+/// The menu VOB of title set `i` (0: the video manager) and its length in
+/// sectors, when it exists and is not empty.
+fn menu_vob<F: FileSystem>(
     fs: &mut F,
-    ts: &TitleSet<F::Node>,
+    sets: &[TitleSet<F::Node>],
+    i: usize,
+) -> Option<(String, Vob<F::Node>, u32)> {
+    let (name, node) = sets.get(i)?.menu.as_ref()?;
+    let size = fs.file_size(node).ok().filter(|&s| s > 0)?;
+    let sectors = u32::try_from(size / PACK).unwrap_or(u32::MAX);
+    Some((
+        name.clone(),
+        Vob {
+            node: node.clone(),
+            size,
+        },
+        sectors,
+    ))
+}
+
+/// Where the IFO (or its backup) of title set `i` places `menu` in a menu VOB
+/// of `sectors` sectors.
+fn menu_location<F: FileSystem>(
+    fs: &mut F,
+    sets: &[TitleSet<F::Node>],
+    i: usize,
     menu: Menu,
-) -> Option<ifo::MenuCell> {
+    sectors: u32,
+) -> Option<ifo::MenuLocation> {
+    let ts = sets.get(i)?;
     ts.ifo
         .iter()
         .chain(ts.bup.iter())
-        .find_map(|node| ifo::menu_cell(fs, node, menu))
+        .find_map(|node| ifo::menu_location(fs, node, menu, sectors))
+}
+
+/// A menu found through the IFO files: its menu VOB and the sectors to look at.
+struct AuthoredMenu<N> {
+    set: usize,
+    label: &'static str,
+    name: String,
+    vob: Vob<N>,
+    sectors: Vec<u32>,
+}
+
+/// The root menu of title set `i`, if its IFO places one in its menu VOB.
+fn root_menu<F: FileSystem>(
+    fs: &mut F,
+    sets: &[TitleSet<F::Node>],
+    i: usize,
+) -> Option<AuthoredMenu<F::Node>> {
+    let (name, vob, sectors) = menu_vob(fs, sets, i)?;
+    match menu_location(fs, sets, i, Menu::Root, sectors)? {
+        ifo::MenuLocation::Sectors(found) => Some(AuthoredMenu {
+            set: i,
+            label: "root menu",
+            name,
+            vob,
+            sectors: found,
+        }),
+        ifo::MenuLocation::TitleSetRoot(_) => None,
+    }
+}
+
+/// The video manager's title menu: its own cells, or the title set root
+/// menu it jumps to (returned as `Err(title set)`).
+fn title_menu<F: FileSystem>(
+    fs: &mut F,
+    sets: &[TitleSet<F::Node>],
+) -> Option<Result<AuthoredMenu<F::Node>, usize>> {
+    let vmg = menu_vob(fs, sets, 0);
+    let sectors = vmg.as_ref().map_or(0, |(_, _, s)| *s);
+    match menu_location(fs, sets, 0, Menu::Title, sectors)? {
+        ifo::MenuLocation::Sectors(found) => {
+            let (name, vob, _) = vmg?;
+            Some(Ok(AuthoredMenu {
+                set: 0,
+                label: "title menu",
+                name,
+                vob,
+                sectors: found,
+            }))
+        }
+        ifo::MenuLocation::TitleSetRoot(n) => Some(Err(usize::from(n))),
+    }
 }
 
 /// A picture of the disc's video: a menu the IFO files point at, a frame of
 /// the main title, or the first picture of a menu VOB, in that order (see the
 /// module documentation). `None` when nothing decodable was found.
 ///
-/// `searched` is set when the disc's title VOB files could be found and
-/// sized, so that the caller does not repeat the search on another view of
-/// the same disc; a `VIDEO_TS` whose title VOBs cannot be read here leaves it
-/// unset.
+/// `searched` is set once video packets were actually read from the disc's
+/// VOBs, so that the caller does not repeat the search on another view of the
+/// same disc; a view whose VOBs cannot be read leaves it unset.
 pub fn video_picture<F: FileSystem>(
     fs: &mut F,
     video_ts: &F::Node,
@@ -558,57 +653,74 @@ pub fn video_picture<F: FileSystem>(
         // VIDEO_TS could not be read.
         return None;
     }
-    // Title VOBs were found and sized: this view of the disc is readable.
-    if sets.iter().any(|ts| ts.total > 0) {
-        *searched = true;
-    }
     // Title sets with title VOBs, largest first (ties: lower number first).
     let mut order: Vec<usize> = (1..sets.len()).filter(|&i| sets[i].total > 0).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(sets[i].total));
     let mut selection = Selection::default();
+    let mut note = |grab: &Grab| {
+        if grab.saw_video() {
+            *searched = true;
+        }
+    };
 
-    // 1. The root menu of the main title set, then the title menu.
+    // 1. Menus the IFO files point at: the main title set's root menu, the
+    // title menu (or the root menu it jumps to), then the root menus of the
+    // other title sets, the first one first.
     let mut decodes = AUTHORED_MENU_DECODES;
     let mut attempts = 0;
-    let authored = order
-        .first()
-        .map(|&i| (i, Menu::Root))
-        .into_iter()
-        .chain(std::iter::once((0, Menu::Title)));
-    'menus: for (i, menu) in authored {
-        let ts = &sets[i];
-        let Some((name, node)) = ts.menu.as_ref() else {
-            continue;
-        };
-        let Some(cell) = menu_cell(fs, ts, menu) else {
-            continue;
-        };
-        let size = fs.file_size(node).unwrap_or(0);
-        let vob = Vob {
-            node: node.clone(),
-            size,
-        };
-        let label = match menu {
-            Menu::Root => "root menu",
-            Menu::Title => "title menu",
-        };
-        let mut sectors = vec![cell.first_vobu];
-        if cell.last_vobu != cell.first_vobu {
-            sectors.push(cell.last_vobu);
-        }
-        for sector in sectors {
-            let start = u64::from(sector) * PACK;
-            if start >= size {
-                continue;
+    let mut authored_decoded = false;
+    let mut tried: Vec<(usize, u32)> = Vec::new();
+    let mut looked_up: Vec<usize> = Vec::new();
+    let mut queue: Vec<Option<usize>> = Vec::new(); // None: the title menu
+    queue.extend(order.first().map(|&i| Some(i)));
+    queue.push(None);
+    queue.push(Some(1));
+    queue.extend(order.iter().skip(1).map(|&i| Some(i)));
+    let mut q = 0;
+    'menus: while q < queue.len() && looked_up.len() < MAX_AUTHORED_MENUS {
+        let entry = queue[q];
+        q += 1;
+        let menu = match entry {
+            Some(i) => {
+                // Only title sets with a menu VOB use up a lookup.
+                if looked_up.contains(&i) || sets.get(i).is_none_or(|ts| ts.menu.is_none()) {
+                    continue;
+                }
+                looked_up.push(i);
+                root_menu(fs, &sets, i)
             }
+            None => {
+                looked_up.push(0);
+                match title_menu(fs, &sets) {
+                    Some(Ok(menu)) => Some(menu),
+                    Some(Err(target)) => {
+                        // Look at the root menu the title menu leads to next.
+                        queue.insert(q, Some(target));
+                        None
+                    }
+                    None => None,
+                }
+            }
+        };
+        let Some(menu) = menu else {
+            continue;
+        };
+        for &sector in &menu.sectors {
             if attempts >= MAX_AUTHORED_MENU_ATTEMPTS {
                 break 'menus;
             }
             attempts += 1;
-            let source = format!("VIDEO_TS/{name} ({label})");
-            let candidate = match grab_frame(fs, &[&vob], start, MENU_SCAN_BYTES, &mut decodes) {
-                Grab::Frame(frame) => Candidate::new(frame, source),
-                Grab::Scrambled | Grab::Nothing => None,
+            tried.push((menu.set, sector));
+            let start = u64::from(sector) * PACK;
+            let grab = grab_frame(fs, &[&menu.vob], start, MENU_SCAN_BYTES, &mut decodes);
+            note(&grab);
+            let source = format!("VIDEO_TS/{} ({})", menu.name, menu.label);
+            let candidate = match grab {
+                Grab::Frame(frame) => {
+                    authored_decoded = true;
+                    Candidate::new(frame, source)
+                }
+                Grab::Scrambled | Grab::Nothing { .. } => None,
             };
             if selection.offer(candidate) {
                 break 'menus;
@@ -629,11 +741,13 @@ pub fn video_picture<F: FileSystem>(
                 }
                 let start = (u128::from(total) * u128::from(permille) / 1000) as u64;
                 let source = format!("VIDEO_TS/VTS_{i:02} title at {}%", permille / 10);
-                let candidate = match grab_frame(fs, &parts, start, MAX_SCAN_BYTES, &mut decodes) {
+                let grab = grab_frame(fs, &parts, start, MAX_SCAN_BYTES, &mut decodes);
+                note(&grab);
+                let candidate = match grab {
                     Grab::Frame(frame) => Candidate::new(frame, source),
                     // Every part of a scrambled title is scrambled.
                     Grab::Scrambled => continue 'titles,
-                    Grab::Nothing => None,
+                    Grab::Nothing { .. } => None,
                 };
                 attempts += 1;
                 if selection.offer(candidate) {
@@ -643,31 +757,32 @@ pub fn video_picture<F: FileSystem>(
         }
     }
 
-    // 3. Nothing presentable yet: the first picture of the menu VOBs, the
-    // video manager's first, then the title sets' in size order.
-    if !selection.found() {
+    // 3. Only when no menu could be located through the IFO files and nothing
+    // presentable was found: the first picture of the menu VOBs, the video
+    // manager's first, then the title sets' in size order. (A located menu,
+    // even a dark one, is preferred over what usually opens VIDEO_TS.VOB: a
+    // warning or a studio logo.)
+    if !selection.found() && !authored_decoded {
         let mut decodes = MENU_DECODES;
         let mut attempts = 0;
-        let menus = std::iter::once(0)
-            .chain(order.iter().copied())
-            .filter_map(|i| sets[i].menu.as_ref());
-        for (name, node) in menus {
+        for i in std::iter::once(0).chain(order.iter().copied()) {
             if attempts >= MAX_MENUS {
                 break;
             }
-            let size = fs.file_size(node).unwrap_or(0);
-            if size == 0 {
+            if tried.contains(&(i, 0)) {
+                // Already looked at from its start in step 1.
                 continue;
             }
-            attempts += 1;
-            let vob = Vob {
-                node: node.clone(),
-                size,
+            let Some((name, vob, _)) = menu_vob(fs, &sets, i) else {
+                continue;
             };
+            attempts += 1;
             let source = format!("VIDEO_TS/{name} (menu)");
-            let candidate = match grab_frame(fs, &[&vob], 0, MAX_SCAN_BYTES, &mut decodes) {
+            let grab = grab_frame(fs, &[&vob], 0, MAX_SCAN_BYTES, &mut decodes);
+            note(&grab);
+            let candidate = match grab {
                 Grab::Frame(frame) => Candidate::new(frame, source),
-                Grab::Scrambled | Grab::Nothing => None,
+                Grab::Scrambled | Grab::Nothing { .. } => None,
             };
             if selection.offer(candidate) {
                 break;
