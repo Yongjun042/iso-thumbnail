@@ -7,8 +7,9 @@
 //! 4. `cover.jpg`, `folder.jpg`, … in the root directory of any data disc.
 //! 5. A picture of the DVD-Video's video (`VIDEO_TS`): its root or title menu,
 //!    else a frame of the main title (see `crate::dvd`).
-//! 6. A key frame of the Blu-ray's main feature (`BDMV/STREAM`), when the disc
-//!    has no artwork (see `crate::bluray`).
+//! 6. A picture of the Blu-ray's video, when the disc has no artwork: its top
+//!    menu with its buttons, else a key frame of its main feature (see
+//!    `crate::bluray`).
 
 use crate::bluray;
 use crate::dvd;

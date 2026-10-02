@@ -61,6 +61,9 @@ pub struct EntryPoint {
     /// `I_end_position_offset`: a coarse bound on the I-picture's size (see
     /// `i_picture_bound`); 0 when not set.
     pub i_end: u8,
+    /// Presentation time of the I-picture in 45 kHz units (the unit of
+    /// playlist times), as the EP_map gives it: to 256 units (5.7 ms).
+    pub pts: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -213,7 +216,9 @@ fn parse_ep_map(d: &[u8], cpi: usize, pid: u16, source_packets: u32) -> Result<V
     let mut last_spn = None;
     for i in 0..num_coarse {
         let c = be64(d, coarse_table + 8 * i)?;
+        // ref_to_EP_fine_id 18 | PTS_EP_coarse 14 | SPN_EP_coarse 32.
         let first = (c >> 46) as usize;
+        let coarse_pts = ((c >> 32) & 0x3FFF) as u32;
         let coarse_spn = c as u32;
         let end = if i + 1 < num_coarse {
             (be64(d, coarse_table + 8 * (i + 1))? >> 46) as usize
@@ -224,8 +229,13 @@ fn parse_ep_map(d: &[u8], cpi: usize, pid: u16, source_packets: u32) -> Result<V
             return Err(Error::Corrupt("EP_map coarse references"));
         }
         for j in first..end {
+            // is_angle_change_point 1 | I_end_position_offset 3 |
+            // PTS_EP_fine 11 | SPN_EP_fine 17.
             let f = be32(d, fine_table + 4 * j)?;
             let i_end = ((f >> 28) & 7) as u8;
+            // In 45 kHz units the coarse part holds bits 31..18 and the fine
+            // part bits 18..8; they share bit 18 (libbluray clpi_lookup_spn).
+            let pts = ((coarse_pts & !1) << 18) + (((f >> 17) & 0x7FF) << 8);
             let spn = (coarse_spn & !0x1FFFF).checked_add(f & 0x1FFFF);
             let Some(spn) = spn else { continue };
             // Keep the map strictly increasing and inside the clip.
@@ -233,7 +243,7 @@ fn parse_ep_map(d: &[u8], cpi: usize, pid: u16, source_packets: u32) -> Result<V
                 continue;
             }
             last_spn = Some(spn);
-            entries.push(EntryPoint { spn, i_end });
+            entries.push(EntryPoint { spn, i_end, pts });
         }
     }
     if entries.is_empty() {
@@ -273,6 +283,19 @@ mod tests {
     /// Builds a minimal clip information file with one video stream and the
     /// given (SPN, I_end) entry points, split into coarse groups of `group`.
     pub(crate) fn build(coding: u8, format: u8, points: &[(u32, u8)], group: usize) -> Vec<u8> {
+        let timed: Vec<(u32, u8, u32)> = points.iter().map(|&(s, i)| (s, i, 0)).collect();
+        build_timed(coding, format, &timed, group)
+    }
+
+    /// As `build`, with the presentation time (45 kHz, a multiple of 256) of
+    /// each entry point. As on real discs, PTS_EP_coarse is the time's bits
+    /// 31..18, so its last bit repeats the first of PTS_EP_fine.
+    pub(crate) fn build_timed(
+        coding: u8,
+        format: u8,
+        points: &[(u32, u8, u32)],
+        group: usize,
+    ) -> Vec<u8> {
         let mut d = vec![0u8; 40];
         d[..8].copy_from_slice(b"HDMV0200");
         // ClipInfo at 40.
@@ -312,12 +335,14 @@ mod tests {
         let fine_start = (4 + 8 * coarse.len()) as u32;
         ep.extend(fine_start.to_be_bytes());
         for &first in &coarse {
-            let spn = points[first].0;
-            let c: u64 = ((first as u64) << 46) | u64::from(spn);
+            let (spn, _, pts) = points[first];
+            let pts_coarse = u64::from(pts >> 18);
+            let c: u64 = ((first as u64) << 46) | (pts_coarse << 32) | u64::from(spn);
             ep.extend(c.to_be_bytes());
         }
-        for &(spn, i_end) in points {
-            let f: u32 = (u32::from(i_end) << 28) | (spn & 0x1FFFF);
+        for &(spn, i_end, pts) in points {
+            let pts_fine = (pts >> 8) & 0x7FF;
+            let f: u32 = (u32::from(i_end) << 28) | (pts_fine << 17) | (spn & 0x1FFFF);
             ep.extend(f.to_be_bytes());
         }
         let mut cpi_block = vec![0u8; 6];
@@ -341,6 +366,28 @@ mod tests {
         assert_eq!(info.video.format, 6);
         let got: Vec<(u32, u8)> = info.entries.iter().map(|e| (e.spn, e.i_end)).collect();
         assert_eq!(got, points);
+    }
+
+    #[test]
+    fn entry_points_carry_their_presentation_times() {
+        // Times on both sides of a coarse boundary (bit 18 is shared by the
+        // coarse and the fine part), and past 2^31 / 45 kHz = 13 hours.
+        let points = [
+            (0, 1, 0),
+            (100, 1, 0x3_FF00),
+            (200, 1, 0x4_0000),
+            (300, 1, 0x4_0100),
+            (400, 1, 0x1234_5600),
+            (500, 1, 0xFFFF_FF00),
+        ];
+        // A coarse group shares bits 31..19, as on real discs: the first four
+        // times fit in one group, the others each need their own.
+        for (group, points) in [(1, &points[..]), (4, &points[..4])] {
+            let info = parse(&build_timed(CODING_H264, 6, points, group)).unwrap();
+            let got: Vec<u32> = info.entries.iter().map(|e| e.pts).collect();
+            let want: Vec<u32> = points.iter().map(|p| p.2).collect();
+            assert_eq!(got, want, "group {group}");
+        }
     }
 
     #[test]

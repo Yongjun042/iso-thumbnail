@@ -32,6 +32,8 @@ pub struct VideoPes {
     /// started after it within the span, or it holds the length its header
     /// states, and nothing of it was left out at the byte limit.
     pub last_complete: bool,
+    /// Whether bytes were left out at the byte limit.
+    pub truncated: bool,
 }
 
 /// The PES payload offset in `pes`, or `None` when it is not a video PES
@@ -118,6 +120,7 @@ pub fn video_pes(
             }
             if closed && (total >= max_bytes || out.packets.len() >= max_packets) {
                 out.last_complete = !truncated;
+                out.truncated = truncated;
                 return Ok(out);
             }
             current = Some(Vec::new());
@@ -144,6 +147,7 @@ pub fn video_pes(
             closed = true;
             if out.packets.len() >= max_packets {
                 out.last_complete = !truncated;
+                out.truncated = truncated;
                 return Ok(out);
             }
         }
@@ -152,7 +156,112 @@ pub fn video_pes(
         Some(last) => push_payload(&mut out, last),
         None => out.last_complete = closed && !truncated,
     }
+    out.truncated = truncated;
     Ok(out)
+}
+
+/// Largest PES packet: `PES_packet_length` is 16 bits.
+const MAX_PES: usize = 6 + 0xFFFF;
+
+/// Reassembles the PES packets of one graphics stream (interactive or
+/// presentation graphics, carried as private_stream_1) from consecutive
+/// spans of a clip.
+pub struct GraphicsPes {
+    pid: u16,
+    current: Option<Vec<u8>>,
+}
+
+impl GraphicsPes {
+    pub fn new(pid: u16) -> Self {
+        Self { pid, current: None }
+    }
+
+    /// Passes a finished PES packet's payload and presentation time to `f`.
+    fn finish(pes: Vec<u8>, f: &mut dyn FnMut(&[u8], Option<u64>) -> bool) -> bool {
+        let start = match pes.get(..9) {
+            Some(h) if h[..4] == [0, 0, 1, 0xBD] && h[6] & 0xC0 == 0x80 => 9 + usize::from(h[8]),
+            _ => return true,
+        };
+        // PTS_DTS_flags, then the 33-bit PTS in 5 bytes with marker bits.
+        let pts = pes
+            .get(9..14)
+            .filter(|_| pes[7] & 0x80 != 0 && start >= 14)
+            .map(|t| {
+                (u64::from(t[0] >> 1 & 7) << 30)
+                    | (u64::from(t[1]) << 22)
+                    | (u64::from(t[2] >> 1) << 15)
+                    | (u64::from(t[3]) << 7)
+                    | u64::from(t[4] >> 1)
+            });
+        match pes.get(start..) {
+            Some(payload) => f(payload, pts),
+            None => true,
+        }
+    }
+
+    /// Feeds `span` (whole source packets from byte `offset` of the clip, a
+    /// source packet boundary) and calls `f` with the payload and PTS (90 kHz)
+    /// of every PES packet completed in it, until `f` returns false. Returns
+    /// whether `f` asked to stop. Fails like `video_pes`.
+    pub fn push(
+        &mut self,
+        span: &[u8],
+        offset: u64,
+        f: &mut dyn FnMut(&[u8], Option<u64>) -> bool,
+    ) -> Result<bool> {
+        for (i, packet) in span.chunks_exact(SOURCE_PACKET).enumerate() {
+            let at = offset
+                .checked_add((i * SOURCE_PACKET) as u64)
+                .ok_or(Error::Corrupt("m2ts offset"))?;
+            if at % ALIGNED_UNIT == 0 && packet[0] & 0xC0 != 0 {
+                return Err(Error::Unsupported("AACS-encrypted stream"));
+            }
+            let ts = &packet[4..];
+            if ts[0] != SYNC_BYTE {
+                return Err(Error::Corrupt("m2ts packet sync"));
+            }
+            let packet_pid = (u16::from(ts[1] & 0x1F) << 8) | u16::from(ts[2]);
+            if packet_pid != self.pid || ts[1] & 0x80 != 0 {
+                continue;
+            }
+            if ts[3] & 0xC0 != 0 {
+                return Err(Error::Unsupported("scrambled transport stream"));
+            }
+            let payload_start = match (ts[3] >> 4) & 3 {
+                1 => 4,
+                3 => 5 + usize::from(ts[4]),
+                _ => continue,
+            };
+            let Some(payload) = ts.get(payload_start..) else {
+                continue;
+            };
+            if ts[1] & 0x40 != 0 {
+                if let Some(done) = self.current.replace(Vec::new()) {
+                    if !Self::finish(done, f) {
+                        return Ok(true);
+                    }
+                }
+            }
+            let Some(pes) = self.current.as_mut() else {
+                continue;
+            };
+            pes.extend_from_slice(payload);
+            let stated = pes
+                .get(4..6)
+                .map_or(0, |l| usize::from(u16::from_be_bytes([l[0], l[1]])));
+            if stated > 0 && pes.len() >= 6 + stated {
+                pes.truncate(6 + stated);
+                let done = self.current.take().unwrap_or_default();
+                if !Self::finish(done, f) {
+                    return Ok(true);
+                }
+            } else if pes.len() > MAX_PES {
+                // Longer than any PES packet can be: drop it.
+                self.current = None;
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +387,100 @@ pub(crate) mod tests {
         let got = video_pes(first_only, 0, 0x1011, 1, 1 << 20).unwrap();
         assert_eq!(got.packets.len(), 1);
         assert!(!got.last_complete);
+    }
+
+    /// Collects what a `GraphicsPes` passes on from `spans`, fed in turn.
+    fn graphics(pid: u16, spans: &[&[u8]], offset: u64) -> Result<Vec<Vec<u8>>> {
+        let mut g = GraphicsPes::new(pid);
+        let mut got = Vec::new();
+        let mut at = offset;
+        for s in spans {
+            g.push(s, at, &mut |p, _| {
+                got.push(p.to_vec());
+                true
+            })?;
+            at += s.len() as u64;
+        }
+        Ok(got)
+    }
+
+    #[test]
+    fn graphics_packets_are_reassembled_across_spans() {
+        let mut s = Vec::new();
+        packetize(0x1400, 0xBD, &[3u8; 700], &mut s);
+        // PES_packet_length of 3 flag/length bytes, 5 PTS bytes, 700 payload.
+        s[12..14].copy_from_slice(&708u16.to_be_bytes());
+        packetize(0x1011, 0xE0, &[1u8; 300], &mut s);
+        packetize(0x1400, 0xBD, &[4u8; 50], &mut s);
+        packetize(0x1400, 0xE0, &[5u8; 50], &mut s);
+        packetize(0x1400, 0xBD, &[6u8; 10], &mut s);
+        // The first packet is complete at its stated length; the second when
+        // the (not private) third starts; the last never.
+        let cut = 2 * SOURCE_PACKET;
+        let got = graphics(0x1400, &[&s[..cut], &s[cut..]], 0).unwrap();
+        assert_eq!(got, vec![vec![3u8; 700], vec![4u8; 50]]);
+        let mut g = GraphicsPes::new(0x1400);
+        let mut n = 0;
+        assert!(g
+            .push(&s, 0, &mut |_, _| {
+                n += 1;
+                false
+            })
+            .unwrap());
+        assert_eq!(n, 1);
+        let mut enc = s.clone();
+        enc[0] |= 0x40;
+        assert!(graphics(0x1400, &[&enc], 0).is_err());
+        assert!(graphics(0x1400, &[&enc], 192).is_ok());
+    }
+
+    #[test]
+    fn graphics_packets_carry_their_presentation_time() {
+        let mut s = Vec::new();
+        packetize(0x1400, 0xBD, &[3u8; 10], &mut s);
+        let header = |s: &[u8], from: usize| {
+            from + s[from..]
+                .windows(4)
+                .position(|w| w == [0, 0, 1, 0xBD])
+                .unwrap()
+        };
+        // PTS 0x1_2345_6789 in the marker-bit layout of the header.
+        let pts: u64 = 0x1_2345_6789;
+        let at = header(&s, 0) + 9;
+        s[at..at + 5].copy_from_slice(&[
+            0x21 | ((pts >> 29) as u8 & 0x0E),
+            (pts >> 22) as u8,
+            ((pts >> 14) as u8) | 1,
+            (pts >> 7) as u8,
+            ((pts << 1) as u8) | 1,
+        ]);
+        packetize(0x1400, 0xBD, &[4u8; 10], &mut s);
+        let second = header(&s, 192);
+        s[second + 7] = 0; // no PTS in the second
+        packetize(0x1400, 0xBD, &[5u8; 10], &mut s);
+        let mut got = Vec::new();
+        GraphicsPes::new(0x1400)
+            .push(&s, 0, &mut |p, t| {
+                got.push((p[0], t));
+                true
+            })
+            .unwrap();
+        assert_eq!(got, [(3, Some(pts)), (4, None)]);
+    }
+
+    #[test]
+    fn a_graphics_packet_that_states_its_length_needs_no_successor() {
+        // The last packet of the PID: only its stated length completes it.
+        let mut s = Vec::new();
+        packetize(0x1400, 0xBD, &[3u8; 700], &mut s);
+        s[12..14].copy_from_slice(&708u16.to_be_bytes());
+        packetize(0x1011, 0xE0, &[1u8; 300], &mut s);
+        assert_eq!(graphics(0x1400, &[&s], 0).unwrap(), vec![vec![3u8; 700]]);
+        let mut g = GraphicsPes::new(0x1400);
+        assert!(g.push(&s, 0, &mut |_, _| false).unwrap());
+        // Without the length it waits for the next packet.
+        s[12..14].copy_from_slice(&[0, 0]);
+        assert!(graphics(0x1400, &[&s], 0).unwrap().is_empty());
     }
 
     #[test]

@@ -1,6 +1,28 @@
 //! Blu-ray video frames: the thumbnail of a Blu-ray without artwork
-//! (`BDMV/META/DL` or `TN`) is a key frame of its main feature, chosen the way
-//! DVD frames are (`crate::dvd`).
+//! (`BDMV/META/DL` or `TN`) is its top menu, else a key frame of its main
+//! feature, chosen the way DVD frames are (`crate::dvd`).
+//!
+//! The top menu comes first:
+//!
+//! - `index.bdmv` names the top menu's object. For an HDMV movie object the
+//!   playlists it plays are found by following its navigation commands
+//!   (`crate::bdnav`); a BD-J object's code cannot be followed, so only the
+//!   playlist it starts by itself is used, if any.
+//! - The first play item of each such playlist (`crate::mpls`) gives the clip
+//!   and its part. An HDMV menu has buttons, so a playlist without an
+//!   interactive graphics stream, or with a pop-up one (a film with its
+//!   pop-up menu), is passed over: it is an intro, a trailer or the film.
+//! - A key frame of the play item playback starts with (`PlayPLatPI` and
+//!   `PlayPLatMK` name it) is decoded as below, at its start and halfway (a
+//!   motion menu may fade in); a still menu's single picture ends the clip.
+//!   The first page of the interactive graphics is drawn over it: the menu
+//!   as it settles, with its default button selected (`crate::igs`). Like
+//!   libbluray, the graphics presented from the play item's IN time on are
+//!   used, looked for a little before the entry point players start from.
+//!
+//! A presentable menu ends the search; otherwise the main feature's frames
+//! follow (until the feature gives one, whatever time the menus took), and
+//! the best frame of all is kept:
 //!
 //! 1. The main feature is the largest `BDMV/STREAM/xxxxx.m2ts`. On real discs
 //!    this is the clip of the main playlist's longest play item, also on discs
@@ -34,14 +56,20 @@
 //! Work is bounded on every axis, also for crafted images: at most
 //! `MAX_STREAMS` stream files are looked at, `MAX_CLIPS` clips tried,
 //! `MAX_ATTEMPTS` positions read, `MAX_DECODES` frames decoded and
-//! `MAX_VIDEO_BYTES` read for all of it, besides the image's own budgets.
+//! `MAX_VIDEO_BYTES` read for all of it, besides the image's own budgets. The
+//! menus take `MENU_PLAYLISTS` playlists, `MENU_ATTEMPTS` positions,
+//! `MENU_DECODES` frames and `MENU_BYTES` (graphics included) of their own,
+//! the bytes out of `MAX_VIDEO_BYTES`.
 
-use crate::clpi::{self, ClipInfo, APP_DEPENDENT_VIEW, MAX_CLPI_BYTES};
+use crate::bdnav::{self, Object, MAX_NAV_BYTES};
+use crate::clpi::{self, ClipInfo, EntryPoint, APP_DEPENDENT_VIEW, MAX_CLPI_BYTES};
 use crate::dvd::{Candidate, Selection};
 use crate::finder::Thumbnail;
 use crate::fs::FileSystem;
+use crate::igs;
 use crate::m2ts::{self, ALIGNED_UNIT, SOURCE_PACKET};
 use crate::mpeg2;
+use crate::mpls::{self, Start, MAX_MPLS_BYTES};
 #[cfg(windows)]
 use crate::nal;
 use crate::yuv::{Colour, Matrix, Primaries, Transfer};
@@ -79,6 +107,24 @@ const DEFAULT_SPAN_UHD: u64 = 3 << 20;
 /// Once a frame is in hand, no new position is started after this long (a
 /// dark UHD disc would otherwise take six decodes of about 250 ms).
 const TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
+/// Top menu playlists tried (a playlist without buttons does not count).
+const MENU_PLAYLISTS: usize = 3;
+/// Positions sampled in a menu's play item, in per mille of its entry
+/// points, in the order tried.
+const MENU_PERMILLE: [u64; 2] = [0, 500];
+/// Positions read and frames decoded in menus, for the whole disc.
+const MENU_ATTEMPTS: usize = 4;
+const MENU_DECODES: usize = 4;
+/// Bytes read for the menus (graphics included), out of `MAX_VIDEO_BYTES`.
+const MENU_BYTES: u64 = 8 << 20;
+/// Bytes of a menu clip read for its interactive graphics, and how many at
+/// a time. A menu's graphics come before its first picture, and real ones
+/// take well under a megabyte.
+const GRAPHICS_BYTES: u64 = 4 << 20;
+const GRAPHICS_CHUNK: u64 = 32 * ALIGNED_UNIT;
+/// How far before the entry point a play item starts from its graphics are
+/// looked for: a display set is multiplexed ahead of its presentation.
+const GRAPHICS_LEAD: u64 = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Codec {
@@ -335,10 +381,13 @@ enum Sample {
 }
 
 /// Decodes the key frame at the start of `span` (from an entry point).
+/// `at_end`: the span runs to the end of the clip, so its last packet is
+/// whole (a still menu's single picture).
 fn decode_span(
     codec: Codec,
     span: &[u8],
     offset: u64,
+    at_end: bool,
     info: &ClipInfo,
     allowance: &mut Allowance,
     #[cfg_attr(not(windows), allow(unused_variables))] session: &mut Decoders,
@@ -357,7 +406,12 @@ fn decode_span(
     };
     match codec {
         Codec::Mpeg => {
-            let es: Vec<u8> = pes.packets.concat();
+            let mut es: Vec<u8> = pes.packets.concat();
+            // A picture that ends the clip is terminated.
+            let terminated = at_end && !pes.truncated;
+            if terminated {
+                es.extend_from_slice(&[0, 0, 1, 0xB7]);
+            }
             // Without a whole I-picture yet (one ends where the next picture
             // starts) the span is read on, up to the most a position may read.
             let Some(range) = mpeg2::find_intra_picture(&es) else {
@@ -366,22 +420,26 @@ fn decode_span(
             if !allowance.decode() {
                 return Ok(Sample::Failed);
             }
+            // Ended only by the end of the clip: every macroblock must
+            // decode, so a picture cut off does not give a grey band (as
+            // `dvd::grab_frame` does at the end of a title).
+            let by_clip_end = terminated && range.end + 4 == es.len();
             Ok(
                 match mpeg2::decode_intra_within(&es[range], mpeg2::MAX_WIDTH, mpeg2::MAX_HEIGHT) {
-                    Ok(frame) => Sample::Frame(frame),
-                    Err(_) => Sample::Failed,
+                    Ok(frame) if !by_clip_end || frame.concealed_macroblocks == 0 => {
+                        Sample::Frame(frame)
+                    }
+                    Ok(_) | Err(_) => Sample::Failed,
                 },
             )
         }
         #[cfg(windows)]
         Codec::Windows(kind) => {
             use crate::mf::{Codec as Mf, Request};
-            // The first packet is complete once another one started after it.
-            let Some(first) = pes
-                .packets
-                .first()
-                .filter(|_| pes.packets.len() > 1 || pes.last_complete)
-            else {
+            // The first packet is complete once another one started after it,
+            // or when it ends the clip.
+            let whole = pes.packets.len() > 1 || pes.last_complete || (at_end && !pes.truncated);
+            let Some(first) = pes.packets.first().filter(|_| whole) else {
                 return Ok(Sample::Incomplete);
             };
             let (format, private) = match kind {
@@ -427,36 +485,299 @@ fn mpeg2_limit() -> usize {
     MAX_SPAN_HD as usize
 }
 
-/// Finds the best frame of the disc's main clips. `searched` is set once
-/// video packets were read, so another view of the same disc does not repeat
-/// the search.
-pub fn video_picture<F: FileSystem>(
+/// The outcome of reading one entry point.
+enum Position {
+    Frame(mpeg2::Frame),
+    Nothing,
+    /// The stream is encrypted or scrambled: give up the disc.
+    GiveUp,
+}
+
+/// Decodes the key frame at `entry` of `clip`. `searched` is set once video
+/// packets were read.
+#[allow(clippy::too_many_arguments)]
+fn sample<F: FileSystem>(
+    fs: &mut F,
+    clip: &Clip<F::Node>,
+    info: &ClipInfo,
+    codec: Codec,
+    entry: EntryPoint,
+    allowance: &mut Allowance,
+    session: &mut Decoders,
+    searched: &mut bool,
+) -> Position {
+    let uhd = info.video.format == clpi::FORMAT_2160P;
+    let (default_span, max_span) = if uhd {
+        (DEFAULT_SPAN_UHD, MAX_SPAN_UHD)
+    } else {
+        (DEFAULT_SPAN_HD, MAX_SPAN_HD)
+    };
+    let first = clpi::i_picture_bound(entry.i_end, uhd)
+        .map_or(default_span, |b| b + ALIGNED_UNIT)
+        .min(max_span);
+    let offset = u64::from(entry.spn) * SOURCE_PACKET as u64;
+    let mut span = match read_span(fs, clip, entry.spn, first, allowance) {
+        Read::Span(s) => s,
+        Read::Encrypted => {
+            // The other view of the disc need not find that again.
+            *searched = true;
+            return Position::GiveUp;
+        }
+        Read::Nothing => return Position::Nothing,
+    };
+    *searched = true;
+    let mut target = first;
+    loop {
+        // No whole source packet of the clip after the span, in a clip of
+        // whole aligned units (as Blu-ray clips are; a copy cut off is not).
+        let at_end = offset
+            .saturating_add(span.len() as u64)
+            .saturating_add(SOURCE_PACKET as u64)
+            > clip.size
+            && clip.size % ALIGNED_UNIT == 0;
+        match decode_span(codec, &span, offset, at_end, info, allowance, session) {
+            Err(()) => return Position::GiveUp, // encrypted or scrambled
+            Ok(Sample::Frame(f)) => return Position::Frame(f),
+            // The access unit runs on past the span (audio packets in
+            // between): read on, doubling the span up to the most a position
+            // may read.
+            Ok(Sample::Incomplete) if target < max_span => {
+                target = target.saturating_mul(2).min(max_span);
+                if !extend_span(fs, clip, offset, &mut span, target, allowance) {
+                    return Position::Nothing;
+                }
+            }
+            Ok(Sample::Incomplete) | Ok(Sample::Failed) => return Position::Nothing,
+        }
+    }
+}
+
+/// Reads and parses `name` in `sub` of the BDMV folder (`None`: in the
+/// folder itself) or, when that fails, its copy in `BDMV/BACKUP`.
+fn read_nav<F: FileSystem, T>(
     fs: &mut F,
     bdmv: &F::Node,
-    searched: &mut bool,
-) -> Option<Thumbnail> {
-    let stream = fs.lookup(bdmv, "STREAM", true).ok()??;
-    let clips = largest_clips(fs, &stream);
-    if clips.is_empty() {
-        return None;
+    sub: Option<&str>,
+    name: &str,
+    max: usize,
+    parse: impl Fn(&[u8]) -> Option<T>,
+) -> Option<T> {
+    fn read_in<F: FileSystem>(
+        fs: &mut F,
+        base: &F::Node,
+        sub: Option<&str>,
+        name: &str,
+        max: usize,
+    ) -> Option<Vec<u8>> {
+        let dir = match sub {
+            Some(sub) => fs.lookup(base, sub, true).ok()??,
+            None => base.clone(),
+        };
+        let file = fs.lookup(&dir, name, false).ok()??;
+        fs.read(&file, max).ok()
     }
-    let mut info_dirs = InfoDirs {
-        main: fs.lookup(bdmv, "CLIPINF", true).ok().flatten(),
-        backup: None,
-    };
-    let started = std::time::Instant::now();
-    let mut allowance = Allowance {
-        attempts: MAX_ATTEMPTS,
-        decodes: MAX_DECODES,
-        bytes: MAX_VIDEO_BYTES,
-    };
-    let mut selection = Selection::default();
-    #[cfg_attr(not(windows), allow(clippy::let_unit_value))]
-    let mut session: Decoders = Default::default();
-    let mut known = Vec::new();
-    'clips: for clip in &clips {
-        let stem = &clip.name[..5];
-        let Some(info) = clip_info(fs, bdmv, &mut info_dirs, stem) else {
+    if let Some(v) = read_in(fs, bdmv, sub, name, max).and_then(|d| parse(&d)) {
+        return Some(v);
+    }
+    let backup = fs.lookup(bdmv, "BACKUP", true).ok()??;
+    read_in(fs, &backup, sub, name, max).and_then(|d| parse(&d))
+}
+
+/// The playlists the top menu plays, and whether it is an HDMV menu (whose
+/// playlists must have buttons).
+fn menu_playlists<F: FileSystem>(fs: &mut F, bdmv: &F::Node) -> (Vec<bdnav::Play>, bool) {
+    let index = read_nav(fs, bdmv, None, "index.bdmv", MAX_NAV_BYTES, |d| {
+        bdnav::parse_index(d).ok()
+    });
+    match index.as_ref().map(|i| &i.top_menu) {
+        Some(Object::Hdmv(_)) => {
+            let objects = read_nav(fs, bdmv, None, "MovieObject.bdmv", MAX_NAV_BYTES, |d| {
+                bdnav::parse_movie_objects(d).ok()
+            });
+            let playlists = match (&index, objects) {
+                (Some(index), Some(objects)) => bdnav::top_menu_playlists(index, &objects),
+                _ => Vec::new(),
+            };
+            (playlists, true)
+        }
+        Some(Object::Bdj(name)) => {
+            let name = format!("{name}.bdjo");
+            let first = read_nav(fs, bdmv, Some("BDJO"), &name, MAX_NAV_BYTES, |d| {
+                bdnav::bdjo_autostart_playlist(d).ok().flatten()
+            });
+            let plays = first.map(|playlist| bdnav::Play {
+                playlist,
+                start: Start::First,
+                button: None,
+            });
+            (plays.into_iter().collect(), false)
+        }
+        _ => (Vec::new(), false),
+    }
+}
+
+enum Graphics {
+    /// What the menu draws, if it could be read.
+    Menu(Option<igs::Menu>),
+    /// A pop-up menu: the playlist is not a top menu.
+    PopUp,
+    /// The stream is encrypted: give up the disc.
+    Encrypted,
+}
+
+/// Reads the first display set of the interactive graphics stream `pid` of
+/// `clip` presented from `in_pts` (90 kHz) on, from byte `offset` on, with
+/// `button` selected before. Like libbluray's `m2ts_filter`, the stream's
+/// packets are passed over until the first one presented at or after
+/// `in_pts`: earlier display sets belong to what the clip holds before.
+fn read_graphics<F: FileSystem>(
+    fs: &mut F,
+    clip: &Clip<F::Node>,
+    (pid, mut offset, in_pts): (u16, u64, u64),
+    button: Option<u16>,
+    allowance: &mut Allowance,
+    searched: &mut bool,
+) -> Graphics {
+    offset -= offset % ALIGNED_UNIT;
+    let end = offset.saturating_add(GRAPHICS_BYTES).min(clip.size);
+    let mut started = false;
+    let mut pes = m2ts::GraphicsPes::new(pid);
+    let mut collector = igs::Collector::default();
+    // A pop-up composition settles the matter at once.
+    while offset < end && !collector.done() && !collector.is_pop_up() {
+        let want = GRAPHICS_CHUNK.min(end - offset);
+        let want = want - want % SOURCE_PACKET as u64;
+        if want == 0 || want > allowance.bytes {
+            break;
+        }
+        allowance.bytes -= want;
+        let mut buf = vec![0u8; want as usize];
+        let n = match fs.read_range(&clip.node, offset, &mut buf) {
+            Ok(n) => n - n % SOURCE_PACKET,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        *searched = true;
+        let push = &mut |p: &[u8], pts: Option<u64>| {
+            started |= pts.is_some_and(|t| t >= in_pts);
+            !started || (collector.push(p) && !collector.is_pop_up())
+        };
+        match pes.push(&buf[..n], offset, push) {
+            Err(crate::error::Error::Unsupported(_)) => return Graphics::Encrypted,
+            // A broken packet: what came before it is kept.
+            Err(_) => break,
+            Ok(_) => {}
+        }
+        offset += n as u64;
+    }
+    if collector.is_pop_up() {
+        Graphics::PopUp
+    } else {
+        Graphics::Menu(collector.into_menu(button))
+    }
+}
+
+/// The entry point players start a play item from: the last one at or
+/// before IN (libbluray `clpi_lookup_spn`), as an index into `info.entries`.
+fn start_entry(info: &ClipInfo, item: &mpls::PlayItem) -> Option<usize> {
+    info.entries.iter().rposition(|e| e.pts <= item.in_time)
+}
+
+/// Where a play item's graphics are looked for: from the start of the clip
+/// when the play item starts at its first entry point, else from
+/// `GRAPHICS_LEAD` before the entry point players start from.
+fn graphics_start(info: &ClipInfo, item: &mpls::PlayItem) -> u64 {
+    match start_entry(info, item) {
+        Some(i) if i > 0 => {
+            let at = u64::from(info.entries[i].spn) * SOURCE_PACKET as u64;
+            at.saturating_sub(GRAPHICS_LEAD)
+        }
+        _ => 0,
+    }
+}
+
+/// The entry points of `info` within a play item's IN and OUT times; else
+/// the one it starts from (a play item within one group of pictures), or all
+/// of them when IN comes before every one (a clip with several time bases).
+fn entries_within(info: &ClipInfo, item: &mpls::PlayItem) -> Vec<EntryPoint> {
+    // Entry point times are rounded down to 256 units.
+    let start = item.in_time.saturating_sub(255);
+    let within: Vec<EntryPoint> = info
+        .entries
+        .iter()
+        .filter(|e| e.pts >= start && e.pts < item.out_time)
+        .copied()
+        .collect();
+    if !within.is_empty() {
+        return within;
+    }
+    match start_entry(info, item) {
+        Some(i) => vec![info.entries[i]],
+        None => info.entries.clone(),
+    }
+}
+
+/// What the menu stage shares with the rest of the search.
+struct Search<'a, N> {
+    stream: &'a N,
+    info_dirs: InfoDirs<N>,
+    selection: Selection,
+    session: Decoders,
+    known: Vec<(Codec, bool)>,
+    started: std::time::Instant,
+}
+
+impl<N> Search<'_, N> {
+    /// Whether no new position should be started: a frame is in hand and
+    /// the time is up.
+    fn late(&self) -> bool {
+        self.started.elapsed() >= TIME_BUDGET && self.selection.best.is_some()
+    }
+}
+
+/// Offers frames of the top menu to the selection. Returns true when the
+/// search is over: a presentable menu, or an encrypted disc.
+fn menu_frames<F: FileSystem>(
+    fs: &mut F,
+    bdmv: &F::Node,
+    search: &mut Search<F::Node>,
+    allowance: &mut Allowance,
+    searched: &mut bool,
+) -> bool {
+    let (plays, hdmv) = menu_playlists(fs, bdmv);
+    let mut tried = 0;
+    for play in plays {
+        if tried == MENU_PLAYLISTS
+            || allowance.attempts == 0
+            || allowance.decodes == 0
+            || search.late()
+        {
+            break;
+        }
+        let name = format!("{:05}.mpls", play.playlist);
+        let Some(item) = read_nav(fs, bdmv, Some("PLAYLIST"), &name, MAX_MPLS_BYTES, |d| {
+            mpls::play_item(d, play.start).ok()
+        }) else {
+            continue;
+        };
+        if hdmv && !item.interactive {
+            continue;
+        }
+        let file = format!("{}.m2ts", item.clip);
+        let Some(node) = fs.lookup(search.stream, &file, false).ok().flatten() else {
+            continue;
+        };
+        let Ok(size) = fs.file_size(&node) else {
+            continue;
+        };
+        let clip = Clip {
+            name: file,
+            node,
+            size,
+        };
+        let Some(info) = clip_info(fs, bdmv, &mut search.info_dirs, &item.clip) else {
             continue;
         };
         if info.application_type == APP_DEPENDENT_VIEW {
@@ -465,15 +786,122 @@ pub fn video_picture<F: FileSystem>(
         let Some(codec) = Codec::of(info.video.coding) else {
             continue;
         };
-        if !decodable(codec, &mut session, &mut known) {
+        if !decodable(codec, &mut search.session, &mut search.known) {
             continue;
         }
-        let uhd = info.video.format == clpi::FORMAT_2160P;
-        let (default_span, max_span) = if uhd {
-            (DEFAULT_SPAN_UHD, MAX_SPAN_UHD)
-        } else {
-            (DEFAULT_SPAN_HD, MAX_SPAN_HD)
+        let entries = entries_within(&info, &item);
+        let menu = match item.ig_pid.filter(|_| hdmv) {
+            Some(pid) => {
+                let at = (
+                    pid,
+                    graphics_start(&info, &item),
+                    2 * u64::from(item.in_time),
+                );
+                match read_graphics(fs, &clip, at, play.button, allowance, searched) {
+                    Graphics::Menu(menu) => menu,
+                    // A film with its pop-up menu: not a menu at all.
+                    Graphics::PopUp => continue,
+                    Graphics::Encrypted => return true,
+                }
+            }
+            None => None,
         };
+        tried += 1;
+        let count = entries.len() as u64;
+        let mut sampled: Vec<usize> = Vec::new();
+        for permille in MENU_PERMILLE {
+            let index = ((count - 1) * permille / 1000) as usize;
+            if sampled.contains(&index) {
+                continue;
+            }
+            sampled.push(index);
+            if allowance.attempts == 0 || allowance.decodes == 0 || search.late() {
+                break;
+            }
+            allowance.attempts -= 1;
+            let frame = match sample(
+                fs,
+                &clip,
+                &info,
+                codec,
+                entries[index],
+                allowance,
+                &mut search.session,
+                searched,
+            ) {
+                Position::Frame(mut f) => {
+                    if let Some(menu) = &menu {
+                        menu.draw(&mut f);
+                    }
+                    Some(f)
+                }
+                Position::Nothing => None,
+                Position::GiveUp => return true,
+            };
+            let source = format!("BDMV/PLAYLIST/{name} (top menu)");
+            if search
+                .selection
+                .offer(frame.and_then(|f| Candidate::new(f, source)))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Finds the best picture of the disc: its top menu, else a frame of its
+/// main clips. `searched` is set once video packets were read, so another
+/// view of the same disc does not repeat the search.
+pub fn video_picture<F: FileSystem>(
+    fs: &mut F,
+    bdmv: &F::Node,
+    searched: &mut bool,
+) -> Option<Thumbnail> {
+    let stream = fs.lookup(bdmv, "STREAM", true).ok()??;
+    let mut search = Search {
+        stream: &stream,
+        info_dirs: InfoDirs {
+            main: fs.lookup(bdmv, "CLIPINF", true).ok().flatten(),
+            backup: None,
+        },
+        selection: Selection::default(),
+        session: Default::default(),
+        known: Vec::new(),
+        started: std::time::Instant::now(),
+    };
+    let mut menu_allowance = Allowance {
+        attempts: MENU_ATTEMPTS,
+        decodes: MENU_DECODES,
+        bytes: MENU_BYTES,
+    };
+    if menu_frames(fs, bdmv, &mut search, &mut menu_allowance, searched) {
+        return search.selection.best.and_then(Candidate::into_thumbnail);
+    }
+    let mut allowance = Allowance {
+        attempts: MAX_ATTEMPTS,
+        decodes: MAX_DECODES,
+        bytes: MAX_VIDEO_BYTES - (MENU_BYTES - menu_allowance.bytes),
+    };
+    let clips = largest_clips(fs, &stream);
+    // The menus may have used up the time with a dark frame: the feature is
+    // sampled until it gives a frame of its own, as before menus were looked
+    // at.
+    let mut feature_found = false;
+    'clips: for clip in &clips {
+        let stem = &clip.name[..5];
+        let Some(info) = clip_info(fs, bdmv, &mut search.info_dirs, stem) else {
+            continue;
+        };
+        if info.application_type == APP_DEPENDENT_VIEW {
+            continue;
+        }
+        let Some(codec) = Codec::of(info.video.coding) else {
+            continue;
+        };
+        if !decodable(codec, &mut search.session, &mut search.known) {
+            continue;
+        }
         let count = info.entries.len() as u64;
         let mut tried: Vec<usize> = Vec::new();
         for permille in SAMPLE_PERMILLE {
@@ -482,52 +910,35 @@ pub fn video_picture<F: FileSystem>(
                 continue;
             }
             tried.push(index);
-            let late = started.elapsed() >= TIME_BUDGET && selection.best.is_some();
-            if allowance.attempts == 0 || allowance.decodes == 0 || late {
+            if allowance.attempts == 0 || allowance.decodes == 0 || (feature_found && search.late())
+            {
                 break 'clips;
             }
             allowance.attempts -= 1;
             let entry = info.entries[index];
-            let first = clpi::i_picture_bound(entry.i_end, uhd)
-                .map_or(default_span, |b| b + ALIGNED_UNIT)
-                .min(max_span);
-            let offset = u64::from(entry.spn) * SOURCE_PACKET as u64;
-            let frame = 'position: {
-                let mut span = match read_span(fs, clip, entry.spn, first, &mut allowance) {
-                    Read::Span(s) => s,
-                    Read::Encrypted => {
-                        // The other view of the disc need not find that again.
-                        *searched = true;
-                        break 'clips;
-                    }
-                    Read::Nothing => break 'position None,
-                };
-                *searched = true;
-                let mut target = first;
-                loop {
-                    match decode_span(codec, &span, offset, &info, &mut allowance, &mut session) {
-                        Err(()) => break 'clips, // encrypted or scrambled
-                        Ok(Sample::Frame(f)) => break 'position Some(f),
-                        // The access unit runs on past the span (audio
-                        // packets in between): read on, doubling the span up
-                        // to the most a position may read.
-                        Ok(Sample::Incomplete) if target < max_span => {
-                            target = target.saturating_mul(2).min(max_span);
-                            if !extend_span(fs, clip, offset, &mut span, target, &mut allowance) {
-                                break 'position None;
-                            }
-                        }
-                        Ok(Sample::Incomplete) | Ok(Sample::Failed) => break 'position None,
-                    }
-                }
+            let frame = match sample(
+                fs,
+                clip,
+                &info,
+                codec,
+                entry,
+                &mut allowance,
+                &mut search.session,
+                searched,
+            ) {
+                Position::Frame(f) => Some(f),
+                Position::Nothing => None,
+                Position::GiveUp => break 'clips,
             };
             let source = format!("BDMV/STREAM/{} ({}%)", clip.name, permille / 10);
-            if selection.offer(frame.and_then(|f| Candidate::new(f, source))) {
+            let candidate = frame.and_then(|f| Candidate::new(f, source));
+            feature_found |= candidate.is_some();
+            if search.selection.offer(candidate) {
                 break 'clips;
             }
         }
     }
-    selection.best.and_then(Candidate::into_thumbnail)
+    search.selection.best.and_then(Candidate::into_thumbnail)
 }
 
 #[cfg(test)]
