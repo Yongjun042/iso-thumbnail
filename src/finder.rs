@@ -17,6 +17,9 @@ use crate::error::{Error, Result};
 use crate::fs::{DirEntry, FileSystem};
 use crate::picture::Picture;
 
+/// A thumbnail size that asks for decoded pictures at full size.
+pub const FULL_SIZE: u32 = u32::MAX;
+
 /// Largest artwork file we are willing to load. Blu-ray thumbnails are a few
 /// hundred KiB; this only limits the root-level cover fallback.
 pub const MAX_IMAGE_BYTES: usize = 16 << 20;
@@ -163,7 +166,15 @@ fn best_image_in<F: FileSystem>(
 /// video search is the costly part, so it runs at most once. It is set once
 /// this call actually read video packets; a view whose video files cannot be
 /// read leaves it unset, so the other view still gets its turn.
-pub fn find_thumbnail<F: FileSystem>(fs: &mut F, dvd_searched: &mut bool) -> Result<Thumbnail> {
+///
+/// `max_side` is the size of the thumbnail wanted: a decoded picture is
+/// reduced on the way to twice that, which saves converting pixels nobody
+/// sees (`FULL_SIZE` keeps it whole).
+pub fn find_thumbnail<F: FileSystem>(
+    fs: &mut F,
+    dvd_searched: &mut bool,
+    max_side: u32,
+) -> Result<Thumbnail> {
     let root = fs.root()?;
     // One pass over the root collects the disc folders and the cover
     // fallbacks: every walk reads the whole directory from the image again.
@@ -222,14 +233,14 @@ pub fn find_thumbnail<F: FileSystem>(fs: &mut F, dvd_searched: &mut bool) -> Res
     }
     // Last: the DVD's menus or a frame of its video, which costs the most.
     if let Some(dir) = video_ts.as_ref().filter(|_| search_dvd) {
-        if let Some(t) = dvd::video_picture(fs, dir, dvd_searched) {
+        if let Some(t) = dvd::video_picture(fs, dir, dvd_searched, max_side) {
             return Ok(t);
         }
     }
     // `search_dvd` as it was before the DVD step: a disc with both folders
     // still gets its Blu-ray turn when the DVD video gave nothing.
     if let Some(dir) = bdmv.as_ref().filter(|_| search_dvd) {
-        if let Some(t) = bluray::video_picture(fs, dir, dvd_searched) {
+        if let Some(t) = bluray::video_picture(fs, dir, dvd_searched, max_side) {
             return Ok(t);
         }
     }

@@ -18,6 +18,10 @@ const NON_LINEAR_QUANTISER_SCALE: [u8; 32] = [
     24, 28, 32, 36, 40, 44, 48, 52, 56, 64, 72, 80, 88, 96, 104, 112,
 ];
 
+/// Macroblocks decoded per picture, as a multiple of its size. Conforming
+/// slices never overlap, so a real picture decodes each macroblock once.
+const MAX_ATTEMPTS_PER_MACROBLOCK: usize = 2;
+
 /// What the picture decoder needs to know about the picture.
 pub struct Params {
     pub mpeg1: bool,
@@ -75,6 +79,8 @@ pub struct PictureDecoder {
     c_stride: usize,
     /// Macroblocks decoded in full.
     done: Vec<bool>,
+    /// Macroblocks decoding was started on, failed ones and repeats included.
+    attempted: usize,
     coef: [i32; 64],
     dc_pred: [i32; 3],
 }
@@ -122,6 +128,7 @@ impl PictureDecoder {
             y_stride,
             c_stride,
             done: vec![false; mb_width * mb_rows],
+            attempted: 0,
             coef: [0; 64],
             dc_pred: [0; 3],
         }
@@ -129,9 +136,17 @@ impl PictureDecoder {
 
     /// Decodes one slice: `start_code` is the slice start code value
     /// (`slice_vertical_position`), `data` the bytes up to the next start code.
+    ///
+    /// A picture's slices may repeat rows (a crafted stream can fill megabytes
+    /// with one row over and over), so at most `MAX_ATTEMPTS_PER_MACROBLOCK`
+    /// times the picture's macroblocks are decoded; later slices are ignored.
+    /// That keeps the cost of a picture to its size, not to its bytes.
     pub fn decode_slice(&mut self, start_code: u8, data: &[u8]) {
         let row = usize::from(start_code).wrapping_sub(1);
-        if self.mb_width == 0 || row >= self.total / self.mb_width {
+        if self.mb_width == 0
+            || row >= self.total / self.mb_width
+            || self.attempted >= MAX_ATTEMPTS_PER_MACROBLOCK * self.total
+        {
             return;
         }
         let mut br = BitReader::new(data);
@@ -193,6 +208,10 @@ impl PictureDecoder {
                 self.skip_concealment_vectors(br)?;
             }
 
+            self.attempted += 1;
+            if self.attempted > MAX_ATTEMPTS_PER_MACROBLOCK * self.total {
+                return Err(Corrupt);
+            }
             self.done[addr] = false;
             self.macroblock(br, addr, field_dct, qscale)?;
             if br.overrun() {

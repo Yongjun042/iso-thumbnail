@@ -1,7 +1,7 @@
 //! Top-level "give me the thumbnail of this image" entry point.
 
 use crate::error::{Error, Result};
-use crate::finder::{find_thumbnail, Thumbnail};
+use crate::finder::{find_thumbnail, Thumbnail, FULL_SIZE};
 use crate::fs::FileSystem;
 use crate::iso9660::Iso9660;
 use crate::reader::{ByteSource, CachedReader};
@@ -21,30 +21,39 @@ pub struct Extracted {
 fn try_udf<S: ByteSource>(
     rd: &mut CachedReader<S>,
     dvd_searched: &mut bool,
+    max_side: u32,
 ) -> Result<(Thumbnail, String)> {
     let mut fs = Udf::open(rd)?;
-    let thumb = find_thumbnail(&mut fs, dvd_searched)?;
+    let thumb = find_thumbnail(&mut fs, dvd_searched, max_side)?;
     Ok((thumb, fs.description()))
 }
 
 fn try_iso9660<S: ByteSource>(
     rd: &mut CachedReader<S>,
     dvd_searched: &mut bool,
+    max_side: u32,
 ) -> Result<(Thumbnail, String)> {
     let mut fs = Iso9660::open(rd)?;
-    let thumb = find_thumbnail(&mut fs, dvd_searched)?;
+    let thumb = find_thumbnail(&mut fs, dvd_searched, max_side)?;
     Ok((thumb, fs.description()))
 }
 
 /// Finds the thumbnail of a disc image. UDF is tried first because Blu-ray
 /// discs are UDF 2.50 and DVDs UDF 1.02; ISO 9660 (with Joliet) is the fallback.
+/// A decoded picture comes at full size.
 pub fn extract_thumbnail<S: ByteSource>(src: S) -> Result<Extracted> {
+    extract_thumbnail_for(src, FULL_SIZE)
+}
+
+/// The same for a thumbnail of at most `max_side` pixels: a decoded picture
+/// may come smaller, though at least twice that size.
+pub fn extract_thumbnail_for<S: ByteSource>(src: S, max_side: u32) -> Result<Extracted> {
     let mut rd = CachedReader::new(src)?;
     // Shared by both passes so a DVD's frame search runs once.
     let mut dvd_searched = false;
-    let (thumbnail, filesystem) = match try_udf(&mut rd, &mut dvd_searched) {
+    let (thumbnail, filesystem) = match try_udf(&mut rd, &mut dvd_searched, max_side) {
         Ok(found) => found,
-        Err(udf_err) => match try_iso9660(&mut rd, &mut dvd_searched) {
+        Err(udf_err) => match try_iso9660(&mut rd, &mut dvd_searched, max_side) {
             Ok(found) => found,
             Err(Error::NoVolume) => return Err(udf_err),
             Err(iso_err) => return Err(iso_err),

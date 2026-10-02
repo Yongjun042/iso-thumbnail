@@ -64,7 +64,7 @@
 use crate::bdnav::{self, Object, MAX_NAV_BYTES};
 use crate::clpi::{self, ClipInfo, EntryPoint, APP_DEPENDENT_VIEW, MAX_CLPI_BYTES};
 use crate::dvd::{Candidate, Selection};
-use crate::finder::Thumbnail;
+use crate::finder::{Thumbnail, FULL_SIZE};
 use crate::fs::FileSystem;
 use crate::igs;
 use crate::m2ts::{self, ALIGNED_UNIT, SOURCE_PACKET};
@@ -382,7 +382,9 @@ enum Sample {
 
 /// Decodes the key frame at the start of `span` (from an entry point).
 /// `at_end`: the span runs to the end of the clip, so its last packet is
-/// whole (a still menu's single picture).
+/// whole (a still menu's single picture). `max_side`: the thumbnail size, for
+/// the Windows decoders' colour conversion (`crate::yuv::to_frame_for`).
+#[allow(clippy::too_many_arguments)]
 fn decode_span(
     codec: Codec,
     span: &[u8],
@@ -391,6 +393,7 @@ fn decode_span(
     info: &ClipInfo,
     allowance: &mut Allowance,
     #[cfg_attr(not(windows), allow(unused_variables))] session: &mut Decoders,
+    #[cfg_attr(not(windows), allow(unused_variables))] max_side: u32,
 ) -> Result<Sample, ()> {
     // MPEG-2 pictures need not start PES packets, so everything is kept; the
     // other codecs only need the first packet, the key frame's access unit.
@@ -471,6 +474,7 @@ fn decode_span(
                 main10: format.main10,
                 private_data: private.as_deref(),
                 fallback_colour: stream_colour(&info.video),
+                max_side,
             };
             Ok(match crate::mf::decode(started, &request) {
                 Some(frame) => Sample::Frame(frame),
@@ -493,8 +497,8 @@ enum Position {
     GiveUp,
 }
 
-/// Decodes the key frame at `entry` of `clip`. `searched` is set once video
-/// packets were read.
+/// Decodes the key frame at `entry` of `clip`, for a thumbnail of
+/// `max_side` pixels. `searched` is set once video packets were read.
 #[allow(clippy::too_many_arguments)]
 fn sample<F: FileSystem>(
     fs: &mut F,
@@ -505,6 +509,7 @@ fn sample<F: FileSystem>(
     allowance: &mut Allowance,
     session: &mut Decoders,
     searched: &mut bool,
+    max_side: u32,
 ) -> Position {
     let uhd = info.video.format == clpi::FORMAT_2160P;
     let (default_span, max_span) = if uhd {
@@ -535,7 +540,9 @@ fn sample<F: FileSystem>(
             .saturating_add(SOURCE_PACKET as u64)
             > clip.size
             && clip.size % ALIGNED_UNIT == 0;
-        match decode_span(codec, &span, offset, at_end, info, allowance, session) {
+        match decode_span(
+            codec, &span, offset, at_end, info, allowance, session, max_side,
+        ) {
             Err(()) => return Position::GiveUp, // encrypted or scrambled
             Ok(Sample::Frame(f)) => return Position::Frame(f),
             // The access unit runs on past the span (audio packets in
@@ -722,6 +729,8 @@ fn entries_within(info: &ClipInfo, item: &mpls::PlayItem) -> Vec<EntryPoint> {
 /// What the menu stage shares with the rest of the search.
 struct Search<'a, N> {
     stream: &'a N,
+    /// The thumbnail size.
+    max_side: u32,
     info_dirs: InfoDirs<N>,
     selection: Selection,
     session: Decoders,
@@ -828,6 +837,8 @@ fn menu_frames<F: FileSystem>(
                 allowance,
                 &mut search.session,
                 searched,
+                // Buttons are drawn over the frame: at full size.
+                FULL_SIZE,
             ) {
                 Position::Frame(mut f) => {
                     if let Some(menu) = &menu {
@@ -857,10 +868,12 @@ pub fn video_picture<F: FileSystem>(
     fs: &mut F,
     bdmv: &F::Node,
     searched: &mut bool,
+    max_side: u32,
 ) -> Option<Thumbnail> {
     let stream = fs.lookup(bdmv, "STREAM", true).ok()??;
     let mut search = Search {
         stream: &stream,
+        max_side,
         info_dirs: InfoDirs {
             main: fs.lookup(bdmv, "CLIPINF", true).ok().flatten(),
             backup: None,
@@ -876,7 +889,10 @@ pub fn video_picture<F: FileSystem>(
         bytes: MENU_BYTES,
     };
     if menu_frames(fs, bdmv, &mut search, &mut menu_allowance, searched) {
-        return search.selection.best.and_then(Candidate::into_thumbnail);
+        return search
+            .selection
+            .best
+            .and_then(|c| c.into_thumbnail(max_side));
     }
     let mut allowance = Allowance {
         attempts: MAX_ATTEMPTS,
@@ -925,6 +941,7 @@ pub fn video_picture<F: FileSystem>(
                 &mut allowance,
                 &mut search.session,
                 searched,
+                search.max_side,
             ) {
                 Position::Frame(f) => Some(f),
                 Position::Nothing => None,
@@ -938,7 +955,10 @@ pub fn video_picture<F: FileSystem>(
             }
         }
     }
-    search.selection.best.and_then(Candidate::into_thumbnail)
+    search
+        .selection
+        .best
+        .and_then(|c| c.into_thumbnail(max_side))
 }
 
 #[cfg(test)]

@@ -158,9 +158,9 @@ impl IInitializeWithStream_Impl for ThumbnailProvider_Impl {
 fn render(stream: IStream, cx: u32) -> Result<(HBITMAP, WTS_ALPHATYPE)> {
     // Any parse failure (no artwork, not a disc image, ...) makes the shell fall
     // back to the ordinary .iso icon.
-    let found = crate::extract_thumbnail(StreamSource(stream))
-        .map_err(|_| windows::core::Error::from(E_FAIL))?;
     let max_side = if cx == 0 { 256 } else { cx };
+    let found = crate::extract_thumbnail_for(StreamSource(stream), max_side)
+        .map_err(|_| windows::core::Error::from(E_FAIL))?;
     let decoded = match &found.thumbnail.content {
         Content::Encoded(data) => decode_to_dib(data, max_side)?,
         Content::Picture(picture) => picture_to_dib(picture, max_side)?,

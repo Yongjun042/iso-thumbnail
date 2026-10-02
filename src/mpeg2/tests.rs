@@ -771,6 +771,19 @@ fn missing_and_corrupt_slices_are_concealed() {
     let frame = decode_intra(&extra).expect("decode");
     assert_eq!(frame.concealed_macroblocks, 0);
 
+    // Row 0 repeated a hundred times (a crafted stream filling megabytes):
+    // decoding stops at twice the picture's macroblocks, so the rows after
+    // it are not decoded and the cost does not grow with the bytes.
+    let mut repeated = es[..slices[0].0].to_vec();
+    for _ in 0..100 {
+        repeated.extend_from_slice(&es[slices[0].0..slices[1].1]);
+    }
+    repeated.extend_from_slice(&es[slices[2].0..]);
+    let frame = decode_intra(&repeated).expect("decode");
+    assert_eq!(frame.concealed_macroblocks, 24);
+    assert!(!is_grey_mb(&frame, 0, 0));
+    assert!(is_grey_mb(&frame, 0, 1));
+
     // No slice decodes at all: an error.
     let mut none = es[..slices[0].0].to_vec();
     none.extend_from_slice(&[0, 0, 1, 0x01, 0x00, 0x00, 0x00, 0x00]);

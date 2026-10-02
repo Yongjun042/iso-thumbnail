@@ -174,6 +174,26 @@ fn decode_name(raw: &[u8]) -> Option<String> {
     }
 }
 
+/// Whether the volume recognition sequence (from byte 32768) names a UDF
+/// volume (NSR02 or NSR03). Its descriptors are 2048 bytes apart, or a block
+/// apart for larger blocks, so every 2048-byte boundary of the first 32 KiB
+/// is looked at. These bytes come in with the ISO 9660 volume descriptors,
+/// which are read next anyway.
+fn names_udf<S: ByteSource>(rd: &mut CachedReader<S>) -> Result<bool> {
+    for sector in 16..32u64 {
+        let off = sector * 2048;
+        if off + 2048 > rd.size() {
+            break;
+        }
+        // One 2048-byte read at a time goes through the chunk cache.
+        let d = rd.read_vec(off, 2048)?;
+        if d[1..6] == *b"NSR02" || d[1..6] == *b"NSR03" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn find_anchor<S: ByteSource>(rd: &mut CachedReader<S>) -> Result<(u32, Vec<u8>)> {
     let size = rd.size();
     let mut candidates: Vec<(u32, u64)> = vec![(2048, 256), (512, 256), (1024, 256), (4096, 256)];
@@ -182,7 +202,12 @@ fn find_anchor<S: ByteSource>(rd: &mut CachedReader<S>) -> Result<(u32, Vec<u8>)
         candidates.push((2048, sectors - 1));
         candidates.push((2048, sectors - 257));
     }
-    for (bs, sector) in candidates {
+    for (i, (bs, sector)) in candidates.into_iter().enumerate() {
+        // Past the usual anchor, the other places are only worth a seek each
+        // on a UDF volume: plain ISO 9660 images (most data discs) skip them.
+        if i == 1 && !names_udf(rd)? {
+            break;
+        }
         let off = sector * bs as u64;
         if off + bs as u64 > size {
             continue;
@@ -357,6 +382,10 @@ impl<'a, S: ByteSource> Udf<'a, S> {
             }
         }
         // Pass 2: maps layered on top of a physical partition.
+        // A logical volume has one virtual partition. Each VAT may take
+        // `MAX_VAT_BYTES` (also without reading as much, from unrecorded or
+        // repeated extents), so further virtual maps are not loaded.
+        let mut vat_loaded = false;
         for (i, raw) in pending {
             let map = match raw {
                 RawMap::Metadata {
@@ -379,7 +408,9 @@ impl<'a, S: ByteSource> Udf<'a, S> {
                         kind: MapKind::Metadata(extents),
                     })
                 }
+                RawMap::Virtual { .. } if vat_loaded => None,
                 RawMap::Virtual { number } => {
+                    vat_loaded = true;
                     let part_idx = udf
                         .part_index(number)
                         .ok_or(Error::Corrupt("virtual map references unknown partition"))?;

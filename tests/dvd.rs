@@ -1059,7 +1059,7 @@ fn an_undecodable_main_title_leaves_room_for_the_next_title_set() {
 
 #[test]
 fn an_unreadable_title_vob_does_not_count_as_searched() {
-    use iso_preview::finder::find_thumbnail;
+    use iso_preview::finder::{find_thumbnail, FULL_SIZE};
     let title = vob(&[RED; 4], 3000, false);
     let files: [(&str, &[u8]); 1] = [("VIDEO_TS/VTS_01_1.VOB", &title)];
     let mut image = udf102(&files, UdfOptions::default());
@@ -1067,7 +1067,7 @@ fn an_unreadable_title_vob_does_not_count_as_searched() {
     let mut rd = reader(image.clone());
     let mut fs = Udf::open(&mut rd).unwrap();
     let mut searched = false;
-    assert!(find_thumbnail(&mut fs, &mut searched).is_ok());
+    assert!(find_thumbnail(&mut fs, &mut searched, FULL_SIZE).is_ok());
     assert!(searched);
     // Break the File Entry of the title VOB (its tag checksum): its size
     // cannot be read, so another view of the disc must still be searched.
@@ -1082,7 +1082,7 @@ fn an_unreadable_title_vob_does_not_count_as_searched() {
     let mut fs = Udf::open(&mut rd).unwrap();
     let mut searched = false;
     assert_eq!(
-        find_thumbnail(&mut fs, &mut searched).err(),
+        find_thumbnail(&mut fs, &mut searched, FULL_SIZE).err(),
         Some(Error::NotFound)
     );
     assert!(!searched);
@@ -1330,7 +1330,7 @@ fn a_menu_cell_outside_the_vob_tries_the_next_language_unit() {
 
 #[test]
 fn unreadable_title_data_does_not_count_as_searched() {
-    use iso_preview::finder::find_thumbnail;
+    use iso_preview::finder::{find_thumbnail, FULL_SIZE};
     // The title VOB's File Entry is intact (its size reads fine) but its
     // allocation descriptor points far outside the image.
     let title = vob(&[RED; 4], 3000, false);
@@ -1348,7 +1348,7 @@ fn unreadable_title_data_does_not_count_as_searched() {
     let mut fs = Udf::open(&mut rd).unwrap();
     let mut searched = false;
     assert_eq!(
-        find_thumbnail(&mut fs, &mut searched).err(),
+        find_thumbnail(&mut fs, &mut searched, FULL_SIZE).err(),
         Some(Error::NotFound)
     );
     assert!(!searched);
@@ -1426,7 +1426,7 @@ fn a_damaged_located_menu_does_not_block_the_last_resort() {
 
 #[test]
 fn reading_only_menus_does_not_count_as_searched() {
-    use iso_preview::finder::find_thumbnail;
+    use iso_preview::finder::{find_thumbnail, FULL_SIZE};
     // The title VOB cannot be read on this view (its File Entry is broken),
     // the menu VOB can but shows nothing presentable.
     let title = vob(&[RED; 4], 3000, false);
@@ -1446,6 +1446,6 @@ fn reading_only_menus_does_not_count_as_searched() {
     let mut rd = reader(image);
     let mut fs = Udf::open(&mut rd).unwrap();
     let mut searched = false;
-    let _ = find_thumbnail(&mut fs, &mut searched);
+    let _ = find_thumbnail(&mut fs, &mut searched, FULL_SIZE);
     assert!(!searched);
 }

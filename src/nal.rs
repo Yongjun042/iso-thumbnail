@@ -9,6 +9,9 @@
 /// Windows H.264 and HEVC decoders.
 pub const MAX_WIDTH: u32 = 4096;
 pub const MAX_HEIGHT: u32 = 2304;
+/// Luma samples of an HEVC picture at level 5.1, the level of UHD Blu-ray
+/// (MaxLumaPs, H.265 Table A.8): 3840x2160 and 4096x2176 fit.
+const HEVC_MAX_LUMA_PS: u64 = 8_912_896;
 /// Largest parameter set parsed (real ones are tens of bytes), and largest
 /// VC-1 sequence + entry point header.
 const MAX_PARAMETER_SET: usize = 4096;
@@ -425,6 +428,10 @@ fn parse_hevc_sps(nal: &[u8]) -> Option<(u32, PictureFormat)> {
     if width > MAX_WIDTH || height > MAX_HEIGHT {
         return None;
     }
+    let coded = u64::from(width) * u64::from(height);
+    if coded > HEVC_MAX_LUMA_PS {
+        return None;
+    }
     if b.flag()? {
         // Conformance window, in units of 2 for 4:2:0.
         let (l, r, t, bo) = (b.ue()?, b.ue()?, b.ue()?, b.ue()?);
@@ -435,6 +442,27 @@ fn parse_hevc_sps(nal: &[u8]) -> Option<(u32, PictureFormat)> {
     let chroma_depth = b.ue()?.checked_add(8)?;
     if !(8..=10).contains(&bit_depth) || !(8..=10).contains(&chroma_depth) {
         return None;
+    }
+    // log2_max_pic_order_cnt_lsb_minus4, then the decoded picture buffer
+    // of each sub-layer. The decoder commits it up front (a UHD 10-bit frame
+    // is about 25 MiB), so it may not exceed level 5.1's MaxDpbSize for the
+    // picture size (H.265 A.4.2): what real discs use.
+    b.ue()?;
+    let first = if b.flag()? { 0 } else { max_sub_layers_minus1 };
+    let max_dpb = match coded {
+        s if s <= HEVC_MAX_LUMA_PS / 4 => 16,
+        s if s <= HEVC_MAX_LUMA_PS / 2 => 12,
+        s if s <= HEVC_MAX_LUMA_PS * 3 / 4 => 8,
+        _ => 6,
+    };
+    for _ in first..=max_sub_layers_minus1 {
+        // sps_max_dec_pic_buffering_minus1, sps_max_num_reorder_pics,
+        // sps_max_latency_increase_plus1.
+        if b.ue()? >= max_dpb {
+            return None;
+        }
+        b.ue()?;
+        b.ue()?;
     }
     PictureFormat {
         width,
@@ -799,13 +827,25 @@ mod tests {
     }
 
     /// An HEVC SPS `id`, with a conformance window cutting (right, bottom)
-    /// samples.
+    /// samples, and a decoded picture buffer of 5 pictures (as UHD discs).
     fn hevc_sps_full(
         id: u32,
         width: u32,
         height: u32,
         bit_depth: u32,
         crop: Option<(u32, u32)>,
+    ) -> Vec<u8> {
+        hevc_sps_dpb(id, width, height, bit_depth, crop, 5)
+    }
+
+    /// The same with a decoded picture buffer of `dpb` pictures.
+    fn hevc_sps_dpb(
+        id: u32,
+        width: u32,
+        height: u32,
+        bit_depth: u32,
+        crop: Option<(u32, u32)>,
+        dpb: u32,
     ) -> Vec<u8> {
         let mut w = Writer::default();
         w.put(0, 4);
@@ -832,6 +872,12 @@ mod tests {
         }
         w.ue(bit_depth - 8);
         w.ue(bit_depth - 8);
+        w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
+        w.put(1, 1); // sps_sub_layer_ordering_info_present_flag
+        w.ue(dpb - 1);
+        w.ue(2); // sps_max_num_reorder_pics
+        w.ue(0);
+        w.put(0, 8); // the rest of the SPS, not read
         nal(&[0x42, 0x01], w.finish())
     }
 
@@ -986,6 +1032,28 @@ mod tests {
         let f = hevc_access_unit(&with(&cropped)).unwrap();
         assert_eq!((f.width, f.height), (3840, 2160));
         assert!(hevc_access_unit(&with(&huge)).is_none());
+    }
+
+    #[test]
+    fn hevc_decoded_picture_buffers_are_limited_to_level_5_1() {
+        let au = hevc_au(3840, 2160, 10);
+        let at = |prefix: [u8; 5]| au.windows(5).position(|x| x == prefix).unwrap() - 1;
+        let (sps_at, pps_at) = (at([0, 0, 1, 0x42, 0x01]), at([0, 0, 1, 0x44, 0x01]));
+        let with = |sps: &[u8]| [&au[..sps_at], sps, &au[pps_at..]].concat();
+        let unit = |w, h, dpb| hevc_access_unit(&with(&hevc_sps_dpb(0, w, h, 10, None, dpb)));
+        // UHD pictures: at most 6 (a crafted 16 commits about 550 MiB).
+        assert!(unit(3840, 2160, 6).is_some());
+        assert!(unit(3840, 2160, 7).is_none());
+        assert!(unit(3840, 2160, 16).is_none());
+        // Smaller pictures may have more, up to 16 for 1080p.
+        assert!(unit(1920, 1080, 16).is_some());
+        assert!(unit(1920, 1080, 17).is_none());
+        assert!(unit(2560, 1440, 12).is_some());
+        assert!(unit(2560, 1440, 13).is_none());
+        // Coded sizes beyond level 5.1, even within the width and height
+        // limits.
+        assert!(unit(4096, 2176, 6).is_some());
+        assert!(unit(4096, 2304, 6).is_none());
     }
 
     #[test]

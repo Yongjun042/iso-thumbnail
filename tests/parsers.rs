@@ -888,3 +888,25 @@ fn udf_read_range_survives_corrupt_file_entries() {
         }
     }
 }
+
+#[test]
+fn plain_iso9660_images_skip_the_other_udf_anchors() {
+    // Without a UDF volume recognition sequence, the anchors at other block
+    // sizes and at the end of the image are not looked for: one read for the
+    // usual anchor, one for the volume descriptors and the directories (they
+    // share a chunk here), instead of seven reads across the image.
+    for joliet in [false, true] {
+        let mut image = build_iso9660(joliet);
+        image.resize(8 << 20, 0);
+        let found = extract(&image).unwrap();
+        assert_big_cover(
+            &found,
+            if joliet {
+                "ISO 9660 (Joliet)"
+            } else {
+                "ISO 9660"
+            },
+        );
+        assert_eq!(found.reads, 2, "joliet {joliet}");
+    }
+}

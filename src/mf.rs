@@ -87,6 +87,9 @@ pub struct Request<'a> {
     pub private_data: Option<&'a [u8]>,
     /// Colour description to use when the decoder does not report one.
     pub fallback_colour: Colour,
+    /// Thumbnail size: frames whose colour needs converting pixel by pixel
+    /// (HDR, BT.2020) are reduced to twice it first (`yuv::to_frame_for`).
+    pub max_side: u32,
 }
 
 /// Keeps Media Foundation started for its lifetime (`MFStartup` / `MFShutdown`
@@ -339,7 +342,12 @@ pub fn decode(_session: &Session, request: &Request) -> Option<Frame> {
             }
             match pull(&decoder) {
                 Pulled::Frame(sample) => {
-                    return read_frame(&decoder, &sample, request.fallback_colour);
+                    return read_frame(
+                        &decoder,
+                        &sample,
+                        request.fallback_colour,
+                        request.max_side,
+                    );
                 }
                 Pulled::StreamChange => set_output_type(&decoder, request.main10)?,
                 Pulled::NeedMoreInput if next_input.is_some() => {}
@@ -416,7 +424,12 @@ fn colour_of(t: &IMFMediaType, fallback: Colour) -> Colour {
     }
 }
 
-fn read_frame(decoder: &IMFTransform, sample: &IMFSample, fallback: Colour) -> Option<Frame> {
+fn read_frame(
+    decoder: &IMFTransform,
+    sample: &IMFSample,
+    fallback: Colour,
+    max_side: u32,
+) -> Option<Frame> {
     unsafe {
         let t = decoder.GetOutputCurrentType(0).ok()?;
         let sub = t.GetGUID(&MF_MT_SUBTYPE).ok()?;
@@ -482,6 +495,7 @@ fn read_frame(decoder: &IMFTransform, sample: &IMFSample, fallback: Colour) -> O
                         area,
                         colour,
                         pixel_aspect,
+                        max_side,
                     )
                 })();
                 let _ = two_d.Unlock2D();
@@ -501,7 +515,16 @@ fn read_frame(decoder: &IMFTransform, sample: &IMFSample, fallback: Colour) -> O
         let frame = match stride {
             Some(stride) if !p.is_null() && stride >= min_stride => {
                 let data = core::slice::from_raw_parts(p, length as usize);
-                convert(data, stride, coded_h, ten_bit, area, colour, pixel_aspect)
+                convert(
+                    data,
+                    stride,
+                    coded_h,
+                    ten_bit,
+                    area,
+                    colour,
+                    pixel_aspect,
+                    max_side,
+                )
             }
             _ => None,
         };
@@ -510,6 +533,7 @@ fn read_frame(decoder: &IMFTransform, sample: &IMFSample, fallback: Colour) -> O
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert(
     data: &[u8],
     stride: usize,
@@ -518,6 +542,7 @@ fn convert(
     (x, y, w, h): (u32, u32, u32, u32),
     colour: Colour,
     pixel_aspect: (u32, u32),
+    max_side: u32,
 ) -> Option<Frame> {
     let chroma_offset = stride.checked_mul(coded_h as usize)?;
     let picture = SemiPlanar {
@@ -530,5 +555,5 @@ fn convert(
         width: w,
         height: h,
     };
-    yuv::to_frame(&picture, colour, pixel_aspect)
+    yuv::to_frame_for(&picture, colour, pixel_aspect, max_side)
 }

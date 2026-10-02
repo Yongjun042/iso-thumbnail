@@ -153,10 +153,27 @@ impl SemiPlanar<'_> {
 /// Converts the displayed area of `src` into an 8-bit BT.709 frame no wider
 /// than `MAX_OUTPUT_WIDTH`. `None` when the buffer description is inconsistent.
 pub fn to_frame(src: &SemiPlanar, colour: Colour, pixel_aspect: (u32, u32)) -> Option<Frame> {
+    to_frame_for(src, colour, pixel_aspect, u32::MAX)
+}
+
+/// The same for a thumbnail of `max_side` pixels. A frame converted pixel by
+/// pixel (HDR tone mapping, BT.2020 gamut, full range: about 50 ns a pixel)
+/// is reduced further, as far as its longer side stays at least twice
+/// `max_side`; a plain frame, which is copied or averaged, is not.
+pub fn to_frame_for(
+    src: &SemiPlanar,
+    colour: Colour,
+    pixel_aspect: (u32, u32),
+    max_side: u32,
+) -> Option<Frame> {
     if !src.valid() {
         return None;
     }
-    let factor = src.width.div_ceil(MAX_OUTPUT_WIDTH).max(1);
+    let mut factor = src.width.div_ceil(MAX_OUTPUT_WIDTH).max(1);
+    if !colour.is_plain() {
+        let by_size = src.width.max(src.height) / max_side.max(1).saturating_mul(2);
+        factor = factor.max(by_size.min(src.width / 2).min(src.height / 2));
+    }
     // At least two output samples each way, so every box of `factor` x
     // `factor` source samples lies inside the area.
     if src.width < 2 * factor || src.height < 2 * factor {
@@ -498,6 +515,31 @@ mod tests {
         assert!(f.cb.iter().all(|&v| v == 75));
         assert!(f.cr.iter().all(|&v| v == 175));
         assert_eq!(f.matrix, ColorMatrix::Bt709);
+    }
+
+    #[test]
+    fn hdr_pictures_are_reduced_for_small_thumbnails() {
+        let hdr10 = Colour {
+            transfer: Transfer::Pq,
+            primaries: Primaries::Bt2020,
+            matrix: Matrix::Bt2020,
+            full_range: false,
+        };
+        let d = uniform(3840, 2160, true, 600, 512, 512);
+        let p = picture(&d, 3840, 2160, true);
+        // Converted pixel by pixel: down to at least twice the thumbnail
+        // (factor 7 for 256), the same as before for large thumbnails.
+        let small = to_frame_for(&p, hdr10, (1, 1), 256).unwrap();
+        assert_eq!((small.width, small.height), (548, 308));
+        let large = to_frame_for(&p, hdr10, (1, 1), 1024).unwrap();
+        assert_eq!((large.width, large.height), (1920, 1080));
+        let whole = to_frame(&p, hdr10, (1, 1)).unwrap();
+        assert_eq!((whole.width, whole.height), (1920, 1080));
+        // The same grey either way.
+        assert!(small.y.iter().all(|&v| v == whole.y[0]));
+        // A plain frame is only averaged as before.
+        let plain = to_frame_for(&p, Colour::BT709, (1, 1), 256).unwrap();
+        assert_eq!((plain.width, plain.height), (1920, 1080));
     }
 
     #[test]

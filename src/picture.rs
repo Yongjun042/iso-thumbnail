@@ -262,6 +262,102 @@ pub fn to_picture(frame: &Frame, area: Rect) -> Picture {
     }
 }
 
+/// Box-filter reduction of a picture made for a thumbnail of at most
+/// `max_side` pixels: the largest whole factor that leaves the longer side on
+/// screen (pixel aspect applied) at least twice `max_side`, so the final
+/// scaling still has detail to work with. 1 when no reduction helps.
+pub fn reduction_for(frame: &Frame, area: Rect, max_side: u32) -> u32 {
+    let shape = Picture {
+        width: area.width,
+        height: area.height,
+        bgra: Vec::new(),
+        pixel_aspect: frame.pixel_aspect,
+    };
+    let (dw, dh) = shape.display_size();
+    let by_size = dw.max(dh) / max_side.max(1).saturating_mul(2);
+    // At least two samples each way remain.
+    by_size.min(area.width / 2).min(area.height / 2).max(1)
+}
+
+/// `area` of the frame reduced by `factor` (box filter on each plane), as a
+/// frame of its own with the frame's pixel aspect and colour: converting it
+/// costs `factor`² less than converting `area`. `None` when there is nothing
+/// to reduce (`factor` 1, or too large for the area) or the planes are
+/// shorter than the dimensions; `area` is clipped to the frame.
+pub fn reduce(frame: &Frame, area: Rect, factor: u32) -> Option<Frame> {
+    if factor <= 1 || !planes_ok(frame) {
+        return None;
+    }
+    let area = clip(frame, area);
+    let f = factor as usize;
+    let (w, h) = (
+        (area.width / factor) as usize,
+        (area.height / factor) as usize,
+    );
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let stride = frame.width as usize;
+    let mut y = vec![0u8; w * h];
+    let n = (f * f) as u32;
+    for (oy, row) in y.chunks_exact_mut(w).enumerate() {
+        let top = area.y as usize + oy * f;
+        for (ox, out) in row.iter_mut().enumerate() {
+            let left = area.x as usize + ox * f;
+            let sum: u32 = (top..top + f)
+                .map(|sy| {
+                    frame.y[sy * stride + left..][..f]
+                        .iter()
+                        .map(|&v| u32::from(v))
+                        .sum::<u32>()
+                })
+                .sum();
+            *out = ((sum + n / 2) / n) as u8;
+        }
+    }
+    // Chroma: the same factor over the area's chroma samples, clipped to the
+    // plane.
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let (sw, sh) = (
+        frame.chroma_width() as usize,
+        frame.chroma_height() as usize,
+    );
+    let (cx0, cy0) = (area.x as usize / 2, area.y as usize / 2);
+    let chroma = |plane: &[u8]| {
+        let mut out = vec![0u8; cw * ch];
+        for (oy, row) in out.chunks_exact_mut(cw).enumerate() {
+            let top = (cy0 + oy * f).min(sh - 1);
+            let bottom = (top + f).min(sh);
+            for (ox, v) in row.iter_mut().enumerate() {
+                let left = (cx0 + ox * f).min(sw - 1);
+                let right = (left + f).min(sw);
+                let (mut sum, mut count) = (0u32, 0u32);
+                for sy in top..bottom {
+                    for &s in &plane[sy * sw + left..sy * sw + right] {
+                        sum += u32::from(s);
+                        count += 1;
+                    }
+                }
+                *v = ((sum + count / 2) / count) as u8;
+            }
+        }
+        out
+    };
+    Some(Frame {
+        width: w as u32,
+        height: h as u32,
+        y,
+        cb: chroma(&frame.cb),
+        cr: chroma(&frame.cr),
+        pixel_aspect: frame.pixel_aspect,
+        matrix: frame.matrix,
+        field_doubled: frame.field_doubled,
+        mpeg1: frame.mpeg1,
+        concealed_macroblocks: frame.concealed_macroblocks,
+        total_macroblocks: frame.total_macroblocks,
+    })
+}
+
 /// Fraction bits of the chroma coefficients.
 const CHROMA_SHIFT: u32 = 16;
 /// Chroma samples are interpolated with weights summing to 8 (3 bits).
@@ -383,6 +479,81 @@ fn planes_ok(frame: &Frame) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reductions_keep_twice_the_thumbnail() {
+        let mut f = frame(1920, 1080, ColorMatrix::Bt709);
+        let all = full_area(&f);
+        assert_eq!(reduction_for(&f, all, 256), 3);
+        assert_eq!(reduction_for(&f, all, 1024), 1);
+        assert_eq!(reduction_for(&f, all, u32::MAX), 1);
+        // A zero size counts as 1: as far as two samples each way allow.
+        assert_eq!(reduction_for(&f, all, 0), 540);
+        // The longer side on screen counts: 720 samples of 32:27 are 853 wide.
+        let mut dvd = frame(720, 480, ColorMatrix::Bt601);
+        dvd.pixel_aspect = (32, 27);
+        assert_eq!(reduction_for(&dvd, full_area(&dvd), 213), 2);
+        assert_eq!(reduction_for(&dvd, full_area(&dvd), 256), 1);
+        // Never below two samples.
+        f.pixel_aspect = (4, 1);
+        let strip = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 4,
+        };
+        assert_eq!(reduction_for(&f, strip, 16), 2);
+    }
+
+    #[test]
+    fn reduce_averages_each_plane_over_the_area() {
+        // Luma: columns alternate 20 and 40; chroma: Cb 100 up to chroma
+        // column 4, 200 from column 5. The area starts at (4, 2), chroma
+        // column 2: the reduced chroma averages columns 2-3, 4-5 and 6-7.
+        let mut f = frame(20, 10, ColorMatrix::Bt709);
+        f.pixel_aspect = (8, 9);
+        for y in 0..10 {
+            for x in 0..20 {
+                f.y[y * 20 + x] = if x % 2 == 0 { 20 } else { 40 };
+            }
+        }
+        for cy in 0..5 {
+            for cx in 0..10 {
+                f.cb[cy * 10 + cx] = if cx < 5 { 100 } else { 200 };
+            }
+        }
+        let area = Rect {
+            x: 4,
+            y: 2,
+            width: 12,
+            height: 8,
+        };
+        let small = reduce(&f, area, 2).unwrap();
+        assert_eq!((small.width, small.height), (6, 4));
+        assert!(small.y.iter().all(|&v| v == 30));
+        assert_eq!(small.cb.len(), 3 * 2);
+        assert_eq!(&small.cb[..3], &[100, 150, 200]);
+        assert!(small.cr.iter().all(|&v| v == 128));
+        assert_eq!(
+            (small.pixel_aspect, small.matrix),
+            ((8, 9), ColorMatrix::Bt709)
+        );
+        // Nothing to do, or nothing left.
+        assert!(reduce(&f, area, 1).is_none());
+        assert!(reduce(&f, area, 9).is_none());
+        let mut short = f.clone();
+        short.y.truncate(10);
+        assert!(reduce(&short, area, 2).is_none());
+        // An area beyond the frame is clipped.
+        let past = Rect {
+            x: 16,
+            y: 6,
+            width: 100,
+            height: 100,
+        };
+        let edge = reduce(&f, past, 2).unwrap();
+        assert_eq!((edge.width, edge.height), (2, 2));
+    }
 
     fn frame(width: u32, height: u32, matrix: ColorMatrix) -> Frame {
         let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));

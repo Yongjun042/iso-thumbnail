@@ -39,4 +39,4 @@ pub mod mf;
 pub mod registry;
 
 pub use error::{Error, Result};
-pub use extract::{extract_thumbnail, Extracted};
+pub use extract::{extract_thumbnail, extract_thumbnail_for, Extracted};

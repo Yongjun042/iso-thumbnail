@@ -6,6 +6,11 @@
 //! reduced resolution through `IWICBitmapSourceTransform` (DCT-domain scaling)
 //! so a large cover never costs a full-size decode. Only JPEG, PNG, GIF and BMP
 //! are decoded, by Windows' built-in decoders picked from the file signature.
+//!
+//! Most of these decoders hand the scaler a few rows at a time, but some
+//! encodings make them hold the whole frame (progressive JPEG, interlaced PNG
+//! and GIF, run-length coded BMP): several bytes per pixel, from a file that
+//! may be tiny. Those get the lower `MAX_BUFFERED_PIXELS`.
 
 use core::ffi::c_void;
 
@@ -25,6 +30,9 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
 /// Largest source image we are willing to decode (width × height).
 pub const MAX_PIXELS: u64 = 16_000_000;
+/// The same for encodings the decoder holds in full (`buffers_whole_frame`):
+/// about 45 MiB for a progressive JPEG.
+pub const MAX_BUFFERED_PIXELS: u64 = 8_000_000;
 /// Largest thumbnail edge we produce; the shell never asks for more.
 pub const MAX_SIDE: u32 = 2560;
 /// Largest intermediate buffer for a decoder-scaled frame.
@@ -54,6 +62,76 @@ fn decoder_for(data: &[u8]) -> Option<&'static GUID> {
         Some(&CLSID_WICBmpDecoder)
     } else {
         None
+    }
+}
+
+/// Whether the decoder holds the whole frame while the image is read: a
+/// progressive JPEG (its coefficients), an interlaced PNG or GIF (the passes),
+/// or a BMP that is run-length coded or embeds another format. Only the
+/// headers are looked at, with every offset checked.
+fn buffers_whole_frame(data: &[u8]) -> bool {
+    let u16be = |o: usize| {
+        data.get(o..o + 2)
+            .map(|b| usize::from(u16::from_be_bytes([b[0], b[1]])))
+    };
+    if data.starts_with(&[0xFF, 0xD8]) {
+        // Markers up to the first frame header (SOFn) or scan (SOS).
+        let mut at = 2;
+        while let (Some(&0xFF), Some(&marker)) = (data.get(at), data.get(at + 1)) {
+            match marker {
+                0xFF => at += 1, // fill byte
+                0xC2 | 0xC6 | 0xCA | 0xCE => return true,
+                0xC0..=0xCF if marker != 0xC4 && marker != 0xC8 && marker != 0xCC => return false,
+                0xDA => return false,
+                0x01 | 0xD0..=0xD7 => at += 2,
+                _ => match u16be(at + 2) {
+                    Some(len) if len >= 2 => at += 2 + len,
+                    _ => return false,
+                },
+            }
+        }
+        false
+    } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        // IHDR first: length, type, width, height, depth, colour type,
+        // compression, filter, interlace.
+        data.get(12..16) == Some(b"IHDR") && data.get(28).is_some_and(|&i| i != 0)
+    } else if data.starts_with(b"GIF8") {
+        // Logical screen descriptor, global colour table, then extensions
+        // until the first image descriptor, whose flags hold the interlace bit.
+        let mut at = 13;
+        if let Some(&flags) = data.get(10) {
+            if flags & 0x80 != 0 {
+                at += 3 << ((flags & 7) + 1);
+            }
+        }
+        loop {
+            match data.get(at) {
+                Some(0x2C) => return data.get(at + 9).is_some_and(|&f| f & 0x40 != 0),
+                Some(0x21) => {
+                    // Label, then sub-blocks up to an empty one.
+                    at += 2;
+                    while let Some(&n) = data.get(at) {
+                        at += 1 + usize::from(n);
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }
+                _ => return false,
+            }
+        }
+    } else if data.starts_with(b"BM") {
+        // BITMAPINFOHEADER (or a later version): biCompression BI_RLE8, BI_RLE4,
+        // BI_JPEG or BI_PNG.
+        let header = data
+            .get(14..18)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let compression = data
+            .get(30..34)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        header.is_some_and(|h| h >= 40) && matches!(compression, Some(1 | 2 | 4 | 5))
+    } else {
+        false
     }
 }
 
@@ -141,7 +219,12 @@ pub fn decode_to_dib(data: &[u8], max_side: u32) -> Result<Decoded> {
         let frame = decoder.GetFrame(0)?;
         let (mut w, mut h) = (0u32, 0u32);
         frame.GetSize(&mut w, &mut h)?;
-        if w == 0 || h == 0 || w as u64 * h as u64 > MAX_PIXELS {
+        let max_pixels = if buffers_whole_frame(data) {
+            MAX_BUFFERED_PIXELS
+        } else {
+            MAX_PIXELS
+        };
+        if w == 0 || h == 0 || w as u64 * h as u64 > max_pixels {
             return Err(E_FAIL.into());
         }
         let has_alpha = frame
@@ -268,7 +351,7 @@ pub fn picture_to_dib(picture: &crate::picture::Picture, max_side: u32) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{decoder_for, fit, picture_to_dib};
+    use super::{buffers_whole_frame, decode_to_dib, decoder_for, fit, picture_to_dib};
     use crate::picture::Picture;
     use core::ffi::c_void;
     use windows::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP};
@@ -283,6 +366,98 @@ mod tests {
         assert!(decoder_for(b"II*\0tiff").is_none());
         assert!(decoder_for(b"II\xBC\x01jxr").is_none());
         assert!(decoder_for(b"").is_none());
+    }
+
+    #[test]
+    fn encodings_decoded_in_full_are_recognised() {
+        // JPEG: baseline, progressive, after other segments and fill bytes.
+        let jpeg = |markers: &[u8]| [&[0xFF, 0xD8][..], markers].concat();
+        assert!(!buffers_whole_frame(&jpeg(&[0xFF, 0xC0, 0, 11])));
+        assert!(buffers_whole_frame(&jpeg(&[0xFF, 0xC2, 0, 11])));
+        assert!(buffers_whole_frame(&jpeg(&[
+            0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xFF, 0xC2, 0, 11
+        ])));
+        assert!(!buffers_whole_frame(&jpeg(&[
+            0xFF, 0xC4, 0, 4, 0, 0, 0xFF, 0xDA, 0, 8
+        ])));
+        assert!(!buffers_whole_frame(&jpeg(&[0xFF, 0xE0, 0, 0xFF])));
+        // PNG: the interlace byte of IHDR.
+        let mut png =
+            b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\x0f\xa0\0\0\x0f\xa0\x08\x06\0\0\0".to_vec();
+        assert!(!buffers_whole_frame(&png));
+        png[28] = 1;
+        assert!(buffers_whole_frame(&png));
+        // GIF: past a global colour table and an extension.
+        let mut gif = b"GIF89a\x10\0\x10\0\x80\0\0".to_vec();
+        gif.extend([0u8; 6]); // 2-entry colour table
+        gif.extend([0x21, 0xF9, 4, 0, 0, 0, 0, 0]);
+        gif.extend([0x2C, 0, 0, 0, 0, 0x10, 0, 0x10, 0, 0x00]);
+        assert!(!buffers_whole_frame(&gif));
+        *gif.last_mut().unwrap() = 0x40;
+        assert!(buffers_whole_frame(&gif));
+        // BMP: the compression of the info header.
+        let mut bmp = b"BM".to_vec();
+        bmp.extend([0u8; 12]);
+        bmp.extend(40u32.to_le_bytes());
+        bmp.extend([0u8; 12]);
+        bmp.extend(0u32.to_le_bytes());
+        assert!(!buffers_whole_frame(&bmp));
+        bmp[30] = 1;
+        assert!(buffers_whole_frame(&bmp));
+        // Short or foreign data.
+        for d in [&b""[..], b"\xFF\xD8", b"GIF89a", b"BM", b"\x89PNG"] {
+            assert!(!buffers_whole_frame(d));
+        }
+    }
+
+    /// A `w` x `h` run-length coded (RLE8) BMP of one grey line repeated:
+    /// a few bytes per line, a full frame for the decoder.
+    fn rle8_bmp(w: u32, h: u32) -> Vec<u8> {
+        let mut pixels = Vec::new();
+        for _ in 0..h {
+            let mut left = w;
+            while left > 0 {
+                let n = left.min(255);
+                pixels.extend([n as u8, 1]);
+                left -= n;
+            }
+            pixels.extend([0, 0]); // end of line
+        }
+        pixels.extend([0, 1]); // end of bitmap
+        let offset = 14 + 40 + 8;
+        let mut d = b"BM".to_vec();
+        d.extend((offset + pixels.len() as u32).to_le_bytes());
+        d.extend([0u8; 4]);
+        d.extend(offset.to_le_bytes());
+        d.extend(40u32.to_le_bytes());
+        d.extend((w as i32).to_le_bytes());
+        d.extend((h as i32).to_le_bytes());
+        d.extend(1u16.to_le_bytes());
+        d.extend(8u16.to_le_bytes());
+        d.extend(1u32.to_le_bytes()); // BI_RLE8
+        d.extend((pixels.len() as u32).to_le_bytes());
+        d.extend([0u8; 8]);
+        d.extend(2u32.to_le_bytes());
+        d.extend(0u32.to_le_bytes());
+        d.extend([0, 0, 0, 0, 128, 128, 128, 0]); // palette
+        d.extend(pixels);
+        d
+    }
+
+    #[test]
+    fn whole_frame_encodings_get_the_lower_pixel_cap() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        // 2000 x 2000 decodes; 4000 x 4000 (16M pixels, under MAX_PIXELS, a
+        // 62 MiB frame for the decoder, from a 130 KB file) is refused.
+        let small = decode_to_dib(&rle8_bmp(2000, 2000), 256).expect("2000 x 2000");
+        assert_eq!((small.width, small.height), (256, 256));
+        unsafe {
+            let _ = DeleteObject(small.bitmap.into());
+        }
+        assert!(decode_to_dib(&rle8_bmp(4000, 4000), 256).is_err());
+        unsafe { CoUninitialize() };
     }
 
     #[test]

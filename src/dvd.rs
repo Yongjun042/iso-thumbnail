@@ -448,8 +448,14 @@ impl Candidate {
         })
     }
 
-    pub(crate) fn into_thumbnail(self) -> Option<Thumbnail> {
-        let picture = picture::to_picture(&self.frame, self.area);
+    /// The picture, reduced for a thumbnail of `max_side` pixels
+    /// (`picture::reduction_for`).
+    pub(crate) fn into_thumbnail(self, max_side: u32) -> Option<Thumbnail> {
+        let factor = picture::reduction_for(&self.frame, self.area, max_side);
+        let picture = match picture::reduce(&self.frame, self.area, factor) {
+            Some(small) => picture::to_picture(&small, picture::full_area(&small)),
+            None => picture::to_picture(&self.frame, self.area),
+        };
         (picture.width > 0 && picture.height > 0).then_some(Thumbnail {
             path: self.source,
             content: Content::Picture(picture),
@@ -648,6 +654,7 @@ pub fn video_picture<F: FileSystem>(
     fs: &mut F,
     video_ts: &F::Node,
     searched: &mut bool,
+    max_side: u32,
 ) -> Option<Thumbnail> {
     let sets = title_sets(fs, video_ts);
     if sets.is_empty() {
@@ -789,7 +796,7 @@ pub fn video_picture<F: FileSystem>(
             }
         }
     }
-    selection.best.and_then(Candidate::into_thumbnail)
+    selection.best.and_then(|c| c.into_thumbnail(max_side))
 }
 
 /// Rank of a jacket picture file name: `J00___5L.MP2` (large) first, then

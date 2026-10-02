@@ -437,6 +437,27 @@ fn mpeg2_files(looks: &[Look]) -> ClipFiles {
 // ----------------------------------------------------------------------------
 
 #[test]
+fn pictures_come_reduced_for_small_thumbnails() {
+    // For a 256-pixel thumbnail the 1280 x 720 frame is converted at half
+    // size (still twice the thumbnail); for 1024 pixels, whole.
+    let files = bdmv(vec![("00001", mpeg2_files(&[RED; 8]))]);
+    let flat: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, d)| (p.as_str(), d.as_slice()))
+        .collect();
+    let image = udf102(&flat, UdfOptions::default());
+    for (max_side, size) in [(256, (640, 360)), (1024, (W, H))] {
+        let found =
+            iso_preview::extract_thumbnail_for(SeekSource(Cursor::new(&image[..])), max_side)
+                .unwrap();
+        assert_eq!(found.thumbnail.path, "BDMV/STREAM/00001.m2ts (25%)");
+        let p = picture(&found);
+        assert_eq!((p.width, p.height), size, "{max_side}");
+        assert!(is_red(p), "{max_side}");
+    }
+}
+
+#[test]
 fn the_main_feature_is_the_largest_clip() {
     let files = bdmv(vec![
         ("00001", mpeg2_files(&[BLUE; 4])),
@@ -534,7 +555,10 @@ fn encrypted_clips_are_left_alone() {
     let root = fs.root().unwrap();
     let dir = fs.lookup(&root, "BDMV", true).unwrap().unwrap();
     let mut searched = false;
-    assert!(bluray::video_picture(&mut fs, &dir, &mut searched).is_none());
+    assert!(
+        bluray::video_picture(&mut fs, &dir, &mut searched, iso_preview::finder::FULL_SIZE)
+            .is_none()
+    );
     drop(fs);
     assert!(rd.bytes < 400_000, "read {} bytes", rd.bytes);
 }
@@ -1557,7 +1581,10 @@ fn an_encrypted_menu_gives_up_the_disc_early() {
     let root = fs.root().unwrap();
     let dir = fs.lookup(&root, "BDMV", true).unwrap().unwrap();
     let mut searched = false;
-    assert!(bluray::video_picture(&mut fs, &dir, &mut searched).is_none());
+    assert!(
+        bluray::video_picture(&mut fs, &dir, &mut searched, iso_preview::finder::FULL_SIZE)
+            .is_none()
+    );
     assert!(searched);
     drop(fs);
     assert!(rd.bytes < 400_000, "read {} bytes", rd.bytes);
@@ -2182,7 +2209,8 @@ mod windows_decoders {
                 .iter()
                 .map(|(p, d)| (p.as_str(), d.as_slice()))
                 .collect();
-            let found = extract(&udf102(&flat, UdfOptions::default())).unwrap();
+            let image = udf102(&flat, UdfOptions::default());
+            let found = extract(&image).unwrap();
             let p = picture(&found);
             assert!(
                 p.width <= 1920 && p.width > 1700,
@@ -2191,6 +2219,16 @@ mod windows_decoders {
             );
             assert_eq!(p.height, 1080, "{range:#x}");
             assert_pattern(&format!("{range:#x}"), p);
+            // For a small thumbnail, a frame tone-mapped pixel by pixel is
+            // reduced before the tone mapping (by 7, to 308 lines); the SDR
+            // one is copied at 1080 lines and reduced at the end (by 3).
+            let small =
+                iso_preview::extract_thumbnail_for(SeekSource(Cursor::new(&image[..])), 256)
+                    .unwrap();
+            let s = picture(&small);
+            let lines = if range == 0x01 { 360 } else { 2160 / 7 };
+            assert_eq!(s.height, lines, "{range:#x}");
+            assert_pattern(&format!("{range:#x} small"), s);
             // Just below the box the chroma is nearly neutral (Cb ramps
             // from top to bottom and crosses zero at mid-height).
             mid.push(luma_at(p, 0.6, 0.55));
