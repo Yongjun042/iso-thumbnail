@@ -17,6 +17,22 @@ Blu-ray는 디스크 안에 들어 있는 아트워크(`BDMV/META/DL/*.jpg`)를,
   문제가 생겨도 탐색기 자체에는 영향이 없습니다.
 - 신뢰할 수 없는 파일을 파싱하는 코드는 모두 경계 검사를 거치며, 패닉은 COM 경계에서 오류 코드로 바뀝니다.
 
+## 미리 보기
+
+설치 전에는 탐색기가 모든 `.iso` 파일을 같은 디스크 이미지 아이콘으로 보여 줍니다.
+
+![설치 전: 모든 .iso 파일이 같은 디스크 이미지 아이콘으로 보이는 탐색기](docs/images/explorer-before.png)
+
+설치 후에는 디스크마다 그 내용을 보여 주는 썸네일이 나옵니다. 아래는 같은 파일들을 탐색기의 아주 큰 아이콘 보기(256 px)로
+본 모습입니다.
+
+![설치 후: 디스크마다 아트워크, 메뉴 화면이 썸네일로 보이는 탐색기](docs/images/explorer-after.png)
+
+- `AKIRA_4K_UHD`, `FROZEN_II`, `MEMENTO` : Blu-ray 디스크에 들어 있는 아트워크(`BDMV/META/DL`)입니다. AKIRA는 UHD Blu-ray입니다.
+- `FUTURE_POP`, `PLASMA_1`, `TOKYO_DISNEY_RESORT_40TH_ANNIVERSARY_SELECTION_1` : 아트워크가 없는 Blu-ray의 탑 메뉴
+  화면입니다. 메뉴 배경 영상의 키 프레임 위에 인터랙티브 그래픽(IG)의 버튼을 그렸습니다.
+- `ACROSS_THE_HORIZON`, `MARCHEN_DVD1` : DVD의 루트 메뉴 화면입니다.
+
 ## 썸네일을 찾는 순서
 
 1. `BDMV/META/DL/*.jpg` : Blu-ray Disc Library 썸네일입니다. 여러 개가 있으면 파일 이름의 `WxH`가 가장 큰 것을 고르고, 이름에 `WxH`가 없으면 파일 크기가 가장 큰 것을 고릅니다.
