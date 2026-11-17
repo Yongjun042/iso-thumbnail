@@ -1,5 +1,9 @@
 # iso-thumbnail
 
+<a href="https://apps.microsoft.com/detail/9n0sck2d4387?referrer=appbadge&mode=direct"><img src="https://get.microsoft.com/images/ko%20dark.svg" width="200" alt="Microsoft Store에서 다운로드"></a>
+
+[English](#english)
+
 Blu-ray와 DVD `.iso` 이미지의 썸네일을 Windows 탐색기에 보여 주는 셸 확장(썸네일 핸들러)입니다.
 Blu-ray는 디스크 안에 들어 있는 아트워크(`BDMV/META/DL/*.jpg`)를, 그것이 없으면 디스크의 탑 메뉴 화면(버튼 포함)이나
 본편 영상의 한 장면을 쓰고, DVD는 재킷 그림(`JACKET_P`)이나 디스크의 메뉴 화면을, 그것도 없으면 본편 영상의 한 장면을 씁니다.
@@ -114,6 +118,16 @@ cargo build --release
 
 ## 설치
 
+### Microsoft Store
+
+[Microsoft Store](https://apps.microsoft.com/detail/9n0sck2d4387)에서 설치하는 방법이 가장 간단합니다. Store 패키지는
+Windows 10 버전 2004(빌드 19041) 이상의 x64 PC에 설치할 수 있습니다. 패키지를 설치하고 제거할 때 Windows가 매니페스트에
+따라 썸네일 핸들러도 함께 등록하고 제거하므로, 아래의 설치 스크립트는 실행하지 않아도 됩니다. Store 패키지와 스크립트
+설치는 같은 CLSID를 쓰므로, 둘 중 하나만 설치해야 합니다. 스크립트로 설치한 적이 있으면 먼저 `scripts\uninstall.cmd`(시스템
+전체에 설치했다면 관리자 프롬프트에서 `scripts\uninstall-machine.cmd`)로 기존 설치를 제거한 뒤에 Store 패키지를 설치하세요.
+
+아래의 방법은 소스에서 직접 빌드한 파일을 설치할 때 씁니다.
+
 ### 현재 사용자만 (관리자 권한 불필요)
 
 ```cmd
@@ -152,6 +166,9 @@ regsvr32 /n /i:user IsoPreview.dll
 같은 앱 안에서 `reg query`로 확인하면 등록이 보이기 때문에 설치가 된 것처럼 보이니 주의하세요.
 
 ## 제거
+
+Microsoft Store에서 설치했다면 Windows 설정의 설치된 앱 목록에서 IsoPreview를 제거합니다. 스크립트로 현재 사용자에게만
+설치했다면 다음 명령을 실행합니다.
 
 ```cmd
 scripts\uninstall.cmd
@@ -459,6 +476,111 @@ UDF 1.02 + ISO 9660 브리지, UDF 전용, ISO 9660 전용, 재킷 그림이 있
 - 2026-10-01 DVD를 지원합니다: 재킷 그림, IFO가 가리키는 메뉴 화면, 본편의 한 장면을 자체 MPEG-1/2 디코더로 만듭니다.
 - 2026-09-23 현재 사용자 설치도 격리된 대리 프로세스에서 실행하고, 파싱과 COM 경계를 강화했으며, 제거 경로를 보강했습니다.
 - 2026-09-22 첫 버전: Blu-ray 아트워크(`BDMV/META`)와 데이터 디스크 커버를 `.iso` 썸네일로 보여 줍니다.
+
+## English
+
+iso-thumbnail (IsoPreview in the Microsoft Store) is a thumbnail handler that makes Windows File Explorer show what is on
+a Blu-ray or DVD `.iso` image instead of the generic disc image icon: the artwork stored on the disc, its menu screen, or a
+scene from the main feature. Images are not mounted; only the sectors needed are read, so finding the artwork in a
+multi-gigabyte image takes about a millisecond.
+
+### Install
+
+The simplest way to install it is from the [Microsoft Store](https://apps.microsoft.com/detail/9n0sck2d4387) (x64,
+Windows 10 version 2004 or later). Windows registers and removes the handler together with the package, so no script is
+needed. To uninstall, remove IsoPreview from the list of installed apps in Windows Settings.
+
+To build and install it from source instead, you need Rust 1.82 or later and the Visual Studio Build Tools (MSVC linker):
+
+```cmd
+cargo build --release
+scripts\install.cmd
+```
+
+`scripts\install.cmd` copies `IsoPreview.dll` and `isopreview-cli.exe` to `%LocalAppData%\Programs\IsoPreview` and
+registers the handler for the current user, without administrator rights. `scripts\install-machine.cmd`, run from an
+elevated prompt, installs for all users. `scripts\uninstall.cmd` and `scripts\uninstall-machine.cmd` remove the
+per-user and the all-users installations, respectively. The Store package and a script installation use the same CLSID,
+so remove one before installing the other.
+
+Explorer caches which handler each file type uses, as well as the thumbnails it has made. If `.iso` files you have
+already looked at still show the generic icon, run `scripts\restart-explorer.cmd`; if that does not help, run
+`scripts\clear-thumbnail-cache.cmd`, which deletes the thumbnail cache so that every thumbnail is made again. Thumbnails
+appear in icon views such as "Large icons" when the folder option "Always show icons, never thumbnails" is off.
+
+### What becomes the thumbnail
+
+The handler goes through these sources in order:
+
+1. Blu-ray artwork in `BDMV/META/DL` (the largest picture), then in `BDMV/META/TN`.
+2. The DVD jacket picture (`JACKET_P/J00___5L.MP2`, otherwise `5M`, then `5S`), found mainly on Japanese DVDs.
+3. A cover picture in the root folder, for data discs: `folder`, `cover`, `poster`, `thumbnail`, `thumb`, `front` or
+   `artwork`, with the extension `.jpg`, `.jpeg`, `.png`, `.bmp` or `.gif`.
+4. DVD menus located through the menu tables of the IFO files: the root menu of the main title set, the title menu, then
+   the root menus of the other title sets.
+5. A scene from the DVD main feature (the title set with the most video), sampled at 25%, 40%, 15%, 55% and 70% of its
+   length, then at the start.
+6. The first frame of the menu VOBs, used only when no menu frame could be decoded at the positions the IFO files give
+   and the earlier steps found nothing usable.
+7. The Blu-ray top menu. The navigation commands of HDMV menus are followed to the playlist the menu plays, and the
+   buttons on the menu's first page, taken from the interactive graphics stream, are drawn over the background video.
+   BD-J menus are drawn by Java code and cannot be reproduced; their autostart playlist is used when there is one.
+8. A scene from the Blu-ray main feature (the largest clip), sampled at the key frames listed at 25%, 40%, 15%, 55% and
+   70% of the clip's `EP_map`.
+
+Frames that are nearly black, washed out or flat (fades, logos, title cards) are passed over, and black bars that come in
+pairs (top and bottom, or left and right) are cropped. If nothing presentable turns up, the best frame found is used; if
+there is nothing at all, Explorer keeps showing the generic `.iso` icon.
+
+DVD video and MPEG-2 Blu-ray video are decoded by an MPEG-1/MPEG-2 intra-frame decoder written in Rust, so no codec has to
+be installed. H.264 and VC-1 Blu-ray video is decoded by the Media Foundation decoders included in Windows (N editions
+need the Media Feature Pack). HEVC (UHD Blu-ray) needs the HEVC Video Extensions from the Microsoft Store; without it,
+such discs show their artwork if they have any. HDR10 and the Dolby Vision base layer are tone-mapped to SDR. Making a
+thumbnail from video usually takes tens to hundreds of milliseconds per disc.
+
+The handler never decrypts content protected by CSS or AACS. On an image made from an encrypted disc without removing
+the encryption, no video scene can be produced, but artwork, jacket pictures, cover pictures in the root folder and
+unencrypted DVD menus are still used.
+
+### Security
+
+The shell runs the handler in its isolated thumbnail surrogate process (`dllhost.exe`), not inside Explorer, for both
+per-user and machine-wide installations. All parsing of the untrusted image is bounds-checked, integer overflow checks
+stay enabled in release builds, and a panic is caught at the COM boundary and returned as an error. The bytes read, the
+number of reads, the frames decoded and the picture sizes are capped, so the work a crafted image can cause for one
+thumbnail stays bounded.
+
+### Command-line tool
+
+```cmd
+isopreview-cli movie.iso
+isopreview-cli movie.iso --mode com --size 256
+isopreview-cli movie.iso --mode shell --size 256
+```
+
+The first form runs the handler's search inside the tool. It prints the file system it read, where the picture came
+from (for example `BDMV/PLAYLIST/00005.mpls (top menu)`), the number of reads, the bytes read and the time taken. A
+picture file taken from the disc is saved next to the image as `movie.thumb.jpg` (or `.png`, `.gif`, `.bmp`, following
+its signature), and a decoded picture (jacket picture, menu screen or scene) as `movie.thumb.png`.
+
+`--mode com` loads `IsoPreview.dll` directly and calls `IThumbnailProvider::GetThumbnail`, without registration.
+`--mode shell` asks Windows for the thumbnail through the registered handler, as Explorer does. Both save the result as
+`movie.thumb.png`.
+
+### Limitations
+
+- Only HDMV Blu-ray menus are drawn with their buttons. For discs with BD-J menus, which most Hollywood releases use, the
+  handler falls back to the autostart playlist or a scene from the main feature. DVD menus show their background video
+  without the subpicture buttons.
+- The main feature is taken to be the largest clip or title set, so on a disc whose extras are larger than the main
+  feature, the thumbnail shows a scene from an extra.
+- Sparing tables of sparable partitions are ignored, HD DVD and Video CD images are not supported, and only the `.iso`
+  extension is associated.
+
+The rest of this README is in Korean: the detailed search order, how it works, the security and performance design
+with its resource limits, tests, the registry keys, the full list of limitations and the change history.
+`cargo test` runs the tests on synthetic disc images built by the test code, and compares the decoders with ffmpeg when
+ffmpeg is on the PATH.
 
 ## 라이선스
 
